@@ -76,7 +76,7 @@ $HOME/.agents/skills/manage-claude-code
 使用 $manage-claude-code 让 Claude Code 修复验收中发现的问题。
 ```
 
-在 macOS 上，Skill 默认使用 `--open-window`：Claude Code 仍作为后台任务运行，Codex 可以继续追踪；同时系统会打开一个 Terminal 新窗口并自动进入 Claude Code 现场。这个窗口使用系统自带的 `Pro` 深色配置，Claude 会话使用深色主题，不会修改 Terminal 的全局默认配置。每次启动后，Skill 会返回管理任务编号、Claude 后台编号，以及查看状态、查看日志、当前终端连接和打开新窗口的命令。窗口被关闭后，也可以让 Codex 再次执行 `open-window`。
+在 macOS 上，Skill 默认使用 `--open-window`：Claude Code 仍作为后台任务运行，Codex 可以继续追踪；同时系统会为每个任务保留一个专用 Terminal 窗口并自动进入 Claude Code 现场。后续查看和续跑都会聚焦、复用这个窗口，保留连续的现场上下文，不会反复打开多个窗口；只有该窗口被关闭后才会创建一个替代窗口。这个窗口使用系统自带的 `Pro` 深色配置，Claude 会话使用深色主题，不会修改 Terminal 的全局默认配置。每次启动后，Skill 会返回管理任务编号、Claude 后台编号，以及查看状态、查看日志、当前终端连接和聚焦任务窗口的命令。
 
 第一次打开窗口时，macOS 可能询问是否允许 Codex（或其 Python 进程）控制 Terminal，需要点击允许。若没有授权，Skill 会在等待 20 秒后返回清楚的权限提示，后台 Claude 任务不会因此丢失。
 
