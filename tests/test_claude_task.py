@@ -32,11 +32,13 @@ elif args == ['auth', 'status']:
 elif args[:2] == ['agents', '--json']:
     print(os.environ.get('FAKE_AGENTS', '[]'))
 elif args and args[0] == 'logs':
-    print('planning\\nimplemented feature\\ntests passed')
+    print('planning\\x1b[31m\\nimplemented feature\\ntests passed\\x1b[0m')
 elif args and args[0] == 'stop':
     print('stopped')
 elif '--background' in args:
-    print('background session started')
+    print('backgrounded · abc12345 · Export customers')
+elif '-p' in args:
+    print('READY')
 else:
     print(json.dumps({'args': args}))
 """,
@@ -49,7 +51,17 @@ else:
                 "CLAUDE_BIN": str(self.fake),
                 "CLAUDE_MANAGER_STATE_DIR": str(self.base / "state"),
                 "FAKE_CALLS": str(self.calls),
-                "FAKE_AGENTS": "[]",
+                "FAKE_AGENTS": json.dumps(
+                    [
+                        {
+                            "id": "abc12345",
+                            "sessionId": "abc12345-1111-2222-3333-444444444444",
+                            "cwd": str(self.project),
+                            "name": "Export customers",
+                            "state": "stopped",
+                        }
+                    ]
+                ),
             }
         )
 
@@ -71,6 +83,9 @@ else:
         doctor = self.run_manager("doctor")
         self.assertTrue(doctor["ready"])
 
+        probe = self.run_manager("doctor", "--probe")
+        self.assertTrue(probe["live_probe"]["ok"])
+
         started = self.run_manager(
             "start",
             "--project",
@@ -85,16 +100,23 @@ else:
             "test",
         )
         task_id = started["task"]["id"]
+        self.assertEqual(started["task"]["agent_id"], "abc12345")
+        self.assertEqual(
+            started["task"]["session_id"],
+            "abc12345-1111-2222-3333-444444444444",
+        )
         self.assertEqual(started["task"]["deployment_scope"], "test")
 
         listing = self.run_manager("list")
         self.assertEqual(len(listing["tasks"]), 1)
 
         status = self.run_manager("status", task_id[:8])
+        self.assertTrue(status["logs"]["available"])
         self.assertIn("tests passed", status["logs"]["tail"])
+        self.assertNotIn("\x1b", status["logs"]["tail"])
 
         attachment = self.run_manager("attach", task_id[:8], "--print-only")
-        self.assertIn("claude attach", attachment["command"])
+        self.assertIn("attach abc12345", attachment["command"])
 
         resumed = self.run_manager(
             "resume", task_id[:8], "--instruction", "Fix the final check"
@@ -109,6 +131,32 @@ else:
         )
         self.assertEqual(len(ledger["tasks"]), 1)
         self.assertEqual(ledger["tasks"][0]["id"], task_id)
+
+    def test_migrates_legacy_task_ids(self):
+        state_dir = self.base / "state"
+        state_dir.mkdir()
+        ledger = {
+            "version": 1,
+            "tasks": [
+                {
+                    "id": "manager-old",
+                    "session_id": "requested-old-session",
+                    "title": "Export customers",
+                    "project": str(self.project),
+                    "status": "started",
+                    "launch_output": "backgrounded · abc12345 · Export customers",
+                }
+            ],
+        }
+        (state_dir / "tasks.json").write_text(json.dumps(ledger), encoding="utf-8")
+
+        listing = self.run_manager("list")
+        task = listing["tasks"][0]
+        self.assertEqual(task["agent_id"], "abc12345")
+        self.assertEqual(
+            task["session_id"], "abc12345-1111-2222-3333-444444444444"
+        )
+        self.assertEqual(task["requested_session_id"], "requested-old-session")
 
 
 if __name__ == "__main__":

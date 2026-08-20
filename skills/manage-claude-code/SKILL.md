@@ -17,7 +17,13 @@ Run this before the first managed task on a machine:
 python3 <skill-dir>/scripts/claude_task.py doctor
 ```
 
-Stop and explain the missing prerequisite if Claude Code is absent or unauthenticated. Do not install, update, or log in without a separate user request.
+If the result reports credential overrides or uncertain connectivity, run the minimal live check before launching work:
+
+```bash
+python3 <skill-dir>/scripts/claude_task.py doctor --probe
+```
+
+The probe makes one small model request and may incur normal provider usage. Stop and explain the missing prerequisite if Claude Code is absent, unauthenticated, or the probe fails. Do not install, update, change credentials, or log in without a separate user request.
 
 ## Define the delegation
 
@@ -46,7 +52,7 @@ python3 <skill-dir>/scripts/claude_task.py start \
 
 Set `--deployment-scope test` or `production` only when the user explicitly authorizes that scope for this task. The default permission mode is `auto`; use `manual`, `acceptEdits`, or `plan` when the user asks for tighter control.
 
-Return the manager task ID, project, goal, and current state. Do not claim that a successfully started process has completed the work.
+Claude Code starts as a background process, so it does not open a separate visible window. Immediately tell the user this, return the manager task ID and native Claude background ID, and show the exact `status`, `logs`, and `attach` commands emitted by the script. If the user wants to watch or operate Claude Code directly, run `attach` from an interactive terminal. Do not claim that a successfully started process has completed the work.
 
 ## Track and report
 

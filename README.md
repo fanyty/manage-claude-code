@@ -8,11 +8,14 @@
 
 - 从 Codex 启动本机 Claude Code 后台任务
 - 为每个任务保存稳定的任务编号和项目目录
+- 区分管理编号、Claude 后台编号和可恢复会话编号
 - 查询任务状态并读取最近日志
 - 恢复已停止或已完成的会话
 - 输出可供用户进入 Claude Code 的连接命令
+- 启动后明确提示 Claude Code 正在后台运行，并同时给出状态、日志和进入现场的命令
 - 要求 Codex在汇报完成前独立检查结果
 - 支持无部署、测试环境和明确授权的正式环境三种范围
+- 检测可能覆盖 Claude 登录的环境凭据，并可执行最小连通性探测
 
 ## 工作方式
 
@@ -70,6 +73,8 @@ $HOME/.agents/skills/manage-claude-code
 使用 $manage-claude-code 让我进入正在运行的 Claude Code 任务。
 使用 $manage-claude-code 让 Claude Code 修复验收中发现的问题。
 ```
+
+Claude Code 默认以后台任务运行，因此不会自动弹出一个新窗口。每次启动后，Skill 会返回管理任务编号、Claude 后台编号，以及三条可直接使用的命令：查看状态、查看日志、进入 Claude Code 现场。想亲自操作时，让 Codex 执行 `attach`，或在交互式终端运行它给出的连接命令。
 
 ## 状态与安全
 

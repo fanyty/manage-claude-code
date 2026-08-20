@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -22,6 +23,17 @@ STATE_FILE = STATE_DIR / "tasks.json"
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 PERMISSION_MODES = ("auto", "manual", "acceptEdits", "plan", "dontAsk")
 DEPLOYMENT_SCOPES = ("none", "test", "production")
+TERMINAL_STATES = {"completed", "failed", "stopped", "exited", "done"}
+CREDENTIAL_OVERRIDE_VARS = (
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+)
+BACKGROUND_ID_RE = re.compile(r"backgrounded\s*[·•]\s*([0-9a-zA-Z-]{8,})")
+OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+SECRET_RE = re.compile(r"(?i)(sk-ant-[A-Za-z0-9_-]{8})[A-Za-z0-9_-]+")
 
 
 class ManagerError(RuntimeError):
@@ -62,15 +74,61 @@ def save_state(data: dict[str, Any]) -> None:
             os.unlink(temp_name)
 
 
-def run_claude(args: list[str], *, cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+def run_claude(
+    args: list[str],
+    *,
+    cwd: Path | None = None,
+    check: bool = True,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
     executable = shutil.which(CLAUDE_BIN)
     if not executable:
         raise ManagerError(f"Claude Code executable not found: {CLAUDE_BIN}")
-    result = subprocess.run([executable, *args], cwd=str(cwd) if cwd else None, text=True, capture_output=True, check=False)
+    try:
+        result = subprocess.run(
+            [executable, *args],
+            cwd=str(cwd) if cwd else None,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        result = subprocess.CompletedProcess(
+            [executable, *args],
+            124,
+            stdout,
+            stderr or f"Timed out after {timeout:g} seconds",
+        )
     if check and result.returncode != 0:
-        detail = (result.stderr or result.stdout or "unknown error").strip()
+        detail = sanitize_text(result.stderr or result.stdout or "unknown error").strip()
         raise ManagerError(f"Claude Code command failed ({result.returncode}): {detail}")
     return result
+
+
+def sanitize_text(text: str) -> str:
+    text = OSC_RE.sub("", text)
+    text = CSI_RE.sub("", text)
+    text = text.replace("\r", "\n")
+    text = "".join(char for char in text if char in "\n\t" or ord(char) >= 32)
+    text = SECRET_RE.sub(r"\1…REDACTED", text)
+    lines = [line.rstrip() for line in text.splitlines()]
+    compact: list[str] = []
+    for line in lines:
+        if line or (compact and compact[-1]):
+            compact.append(line)
+    return "\n".join(compact).strip()
+
+
+def parse_background_id(output: str) -> str:
+    match = BACKGROUND_ID_RE.search(sanitize_text(output))
+    return match.group(1) if match else ""
+
+
+def manager_command(*args: str) -> str:
+    return shlex.join([sys.executable, str(Path(__file__).resolve()), *args])
 
 
 def find_task(data: dict[str, Any], task_id: str) -> dict[str, Any]:
@@ -86,11 +144,16 @@ def find_task(data: dict[str, Any], task_id: str) -> dict[str, Any]:
 
 
 def agent_id(agent: dict[str, Any]) -> str:
-    for key in ("id", "sessionId", "session_id", "agentId", "conversationId"):
-        value = agent.get(key)
-        if value:
-            return str(value)
-    return ""
+    return str(agent.get("id") or agent.get("agentId") or "")
+
+
+def agent_session_id(agent: dict[str, Any]) -> str:
+    return str(
+        agent.get("sessionId")
+        or agent.get("session_id")
+        or agent.get("conversationId")
+        or ""
+    )
 
 
 def agent_status(agent: dict[str, Any] | None) -> str:
@@ -115,17 +178,66 @@ def get_agents(include_completed: bool = True) -> list[dict[str, Any]]:
     return payload if isinstance(payload, list) else []
 
 
-def match_agent(agents: list[dict[str, Any]], session_id: str) -> dict[str, Any] | None:
-    if not session_id:
-        return None
+def match_agent(agents: list[dict[str, Any]], task: dict[str, Any]) -> dict[str, Any] | None:
+    identifiers = {
+        str(task.get(key, ""))
+        for key in ("agent_id", "session_id", "requested_session_id")
+        if task.get(key)
+    }
+    parsed = parse_background_id(str(task.get("launch_output", "")))
+    if parsed:
+        identifiers.add(parsed)
     for agent in agents:
-        current_id = agent_id(agent)
-        if current_id and (current_id == session_id or current_id.startswith(session_id) or session_id.startswith(current_id)):
-            return agent
+        native_ids = {value for value in (agent_id(agent), agent_session_id(agent)) if value}
+        for expected in identifiers:
+            if any(
+                native == expected
+                or native.startswith(expected)
+                or expected.startswith(native)
+                for native in native_ids
+            ):
+                return agent
+    candidates = [
+        agent
+        for agent in agents
+        if agent.get("name") == task.get("title")
+        and str(Path(str(agent.get("cwd", ""))).expanduser()) == task.get("project")
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
     return None
 
 
-def command_doctor(_: argparse.Namespace) -> None:
+def hydrate_task(task: dict[str, Any], agent: dict[str, Any] | None = None) -> bool:
+    changed = False
+    parsed = parse_background_id(str(task.get("launch_output", "")))
+    if parsed and task.get("agent_id") != parsed:
+        task["agent_id"] = parsed
+        changed = True
+    if agent:
+        native_agent_id = agent_id(agent)
+        native_session_id = agent_session_id(agent)
+        if native_agent_id and task.get("agent_id") != native_agent_id:
+            task["agent_id"] = native_agent_id
+            changed = True
+        if native_session_id and task.get("session_id") != native_session_id:
+            if task.get("session_id") and not task.get("requested_session_id"):
+                task["requested_session_id"] = task["session_id"]
+            task["session_id"] = native_session_id
+            changed = True
+    return changed
+
+
+def task_agent_id(task: dict[str, Any]) -> str:
+    value = str(task.get("agent_id") or parse_background_id(str(task.get("launch_output", ""))))
+    if not value:
+        raise ManagerError(
+            f"No Claude background ID recorded for task {task.get('id')}; run list to refresh it"
+        )
+    return value
+
+
+def command_doctor(args: argparse.Namespace) -> None:
     executable = shutil.which(CLAUDE_BIN)
     if not executable:
         emit({"ready": False, "error": f"Claude Code executable not found: {CLAUDE_BIN}"}, 1)
@@ -134,8 +246,49 @@ def command_doctor(_: argparse.Namespace) -> None:
     try:
         auth_payload: Any = json.loads(auth.stdout) if auth.stdout.strip() else {}
     except json.JSONDecodeError:
-        auth_payload = {"raw": (auth.stdout or auth.stderr).strip()}
-    emit({"ready": auth.returncode == 0, "executable": executable, "version": version, "authenticated": auth.returncode == 0, "auth": auth_payload, "state_file": str(STATE_FILE)}, 0 if auth.returncode == 0 else 1)
+        auth_payload = {"raw": sanitize_text(auth.stdout or auth.stderr)}
+    overrides = [name for name in CREDENTIAL_OVERRIDE_VARS if os.environ.get(name)]
+    probe_payload: dict[str, Any] | None = None
+    ready = auth.returncode == 0
+    if args.probe:
+        probe = run_claude(
+            [
+                "-p",
+                "--permission-mode",
+                "plan",
+                "--max-budget-usd",
+                "0.02",
+                "Reply exactly READY. Do not use tools.",
+            ],
+            check=False,
+            timeout=60,
+        )
+        probe_payload = {
+            "ok": probe.returncode == 0,
+            "returncode": probe.returncode,
+            "detail": sanitize_text(probe.stdout or probe.stderr)[-1000:],
+        }
+        ready = ready and probe.returncode == 0
+    warning = None
+    if overrides and not args.probe:
+        warning = (
+            "Environment credentials may override the reported login. "
+            "Run doctor --probe to verify a real request."
+        )
+    emit(
+        {
+            "ready": ready,
+            "executable": executable,
+            "version": version,
+            "authenticated": auth.returncode == 0,
+            "auth": auth_payload,
+            "credential_override_variables": overrides,
+            "live_probe": probe_payload,
+            "warning": warning,
+            "state_file": str(STATE_FILE),
+        },
+        0 if ready else 1,
+    )
 
 
 def build_prompt(args: argparse.Namespace) -> str:
@@ -175,18 +328,25 @@ def command_start(args: argparse.Namespace) -> None:
     for task in data["tasks"]:
         if task.get("project") != str(project):
             continue
-        active_agent = match_agent(agents, str(task.get("session_id", "")))
-        if active_agent and agent_status(active_agent).lower() not in {"completed", "failed", "stopped", "exited"}:
+        active_agent = match_agent(agents, task)
+        if active_agent and agent_status(active_agent).lower() not in TERMINAL_STATES:
             raise ManagerError(f"Project already has an active managed task: {task['id']} ({agent_status(active_agent)})")
-    session_id = str(uuid.uuid4())
-    command = ["--background", "--session-id", session_id, "--name", args.title, "--permission-mode", args.permission_mode]
+    manager_id = str(uuid.uuid4())
+    command = ["--background", "--name", args.title, "--permission-mode", args.permission_mode]
     if args.model:
         command.extend(["--model", args.model])
     command.append(build_prompt(args))
     result = run_claude(command, cwd=project)
+    background_id = parse_background_id(result.stdout or result.stderr)
+    if not background_id:
+        raise ManagerError(
+            "Claude Code started without returning a recognizable background ID: "
+            + sanitize_text(result.stdout or result.stderr)[-1000:]
+        )
     task = {
-        "id": session_id,
-        "session_id": session_id,
+        "id": manager_id,
+        "agent_id": background_id,
+        "session_id": None,
         "title": args.title,
         "project": str(project),
         "goal": args.goal.strip(),
@@ -197,79 +357,144 @@ def command_start(args: argparse.Namespace) -> None:
         "status": "started",
         "created_at": now(),
         "updated_at": now(),
-        "launch_output": result.stdout.strip(),
+        "launch_output": sanitize_text(result.stdout),
         "history": [],
     }
+    current = match_agent(get_agents(include_completed=True), task)
+    hydrate_task(task, current)
     data["tasks"].append(task)
     save_state(data)
-    emit({"task": task, "next": f"status {session_id}"})
+    emit(
+        {
+            "task": task,
+            "native_agent": current,
+            "visibility": "Claude Code is running in the background; use attach to enter its live terminal session.",
+            "commands": {
+                "status": manager_command("status", manager_id),
+                "logs": manager_command("logs", manager_id),
+                "attach": manager_command("attach", manager_id),
+            },
+        }
+    )
 
 
 def command_list(_: argparse.Namespace) -> None:
     data = load_state()
     agents = get_agents(include_completed=True)
     tasks = []
+    changed = False
     for task in data["tasks"]:
+        current = match_agent(agents, task)
+        changed = hydrate_task(task, current) or changed
         item = dict(task)
-        current = match_agent(agents, str(task.get("session_id", "")))
         item["native_agent"] = current
         item["observed_status"] = agent_status(current) if current else task.get("status", "unknown")
         tasks.append(item)
-    unmanaged = [agent for agent in agents if not any(match_agent([agent], str(task.get("session_id", ""))) for task in data["tasks"])]
+    if changed:
+        save_state(data)
+    unmanaged = [agent for agent in agents if not any(match_agent([agent], task) for task in data["tasks"])]
     emit({"tasks": tasks, "unmanaged_agents": unmanaged})
 
 
 def read_logs(task: dict[str, Any], lines: int) -> dict[str, Any]:
-    result = run_claude(["logs", task["session_id"]], check=False)
-    text = (result.stdout or result.stderr or "").rstrip()
-    return {"returncode": result.returncode, "tail": "\n".join(text.splitlines()[-lines:])}
+    result = run_claude(["logs", task_agent_id(task)], check=False)
+    text = sanitize_text(result.stdout or result.stderr or "")
+    available = result.returncode == 0
+    return {
+        "available": available,
+        "cached": False,
+        "returncode": result.returncode,
+        "tail": "\n".join(text.splitlines()[-lines:]) if available else "",
+        "reason": None if available else text,
+    }
+
+
+def retain_logs(task: dict[str, Any], logs: dict[str, Any], lines: int) -> bool:
+    if logs["available"]:
+        tail = str(logs.get("tail", ""))
+        if tail:
+            task["last_log_tail"] = tail
+            task["last_log_at"] = now()
+            return True
+        return False
+    cached = str(task.get("last_log_tail", ""))
+    if cached:
+        logs["tail"] = "\n".join(cached.splitlines()[-lines:])
+        logs["cached"] = True
+    return False
 
 
 def command_status(args: argparse.Namespace) -> None:
     data = load_state()
     task = find_task(data, args.task_id)
-    current = match_agent(get_agents(include_completed=True), task["session_id"])
+    current = match_agent(get_agents(include_completed=True), task)
+    changed = hydrate_task(task, current)
     logs = read_logs(task, args.lines)
+    changed = retain_logs(task, logs, args.lines) or changed
     if current:
         task["status"] = agent_status(current)
         task["updated_at"] = now()
+        changed = True
+    if changed:
         save_state(data)
     emit({"task": task, "native_agent": current, "logs": logs})
 
 
 def command_logs(args: argparse.Namespace) -> None:
-    task = find_task(load_state(), args.task_id)
-    emit({"task_id": task["id"], "logs": read_logs(task, args.lines)})
+    data = load_state()
+    task = find_task(data, args.task_id)
+    logs = read_logs(task, args.lines)
+    if retain_logs(task, logs, args.lines):
+        save_state(data)
+    emit({"task_id": task["id"], "logs": logs})
 
 
 def command_resume(args: argparse.Namespace) -> None:
     data = load_state()
     task = find_task(data, args.task_id)
-    active = match_agent(get_agents(include_completed=False), task["session_id"])
-    if active and agent_status(active).lower() not in {"completed", "failed", "stopped", "exited"}:
+    active = match_agent(get_agents(include_completed=False), task)
+    if active and agent_status(active).lower() not in TERMINAL_STATES:
         raise ManagerError(f"Task is still active ({agent_status(active)}). Attach to it or wait before resuming.")
-    command = ["--background", "--resume", task["session_id"], "--permission-mode", args.permission_mode or task.get("permission_mode", "auto"), args.instruction]
+    session_id = str(task.get("session_id") or "")
+    if not session_id:
+        raise ManagerError(f"No resumable Claude session ID recorded for task {task['id']}")
+    command = ["--background", "--resume", session_id, "--permission-mode", args.permission_mode or task.get("permission_mode", "auto"), args.instruction]
     result = run_claude(command, cwd=Path(task["project"]))
     task.setdefault("history", []).append({"at": now(), "action": "resume", "instruction": args.instruction})
     task["status"] = "resumed"
     task["updated_at"] = now()
-    task["launch_output"] = result.stdout.strip()
+    task["launch_output"] = sanitize_text(result.stdout)
+    new_background_id = parse_background_id(result.stdout or result.stderr)
+    if not new_background_id:
+        raise ManagerError("Claude Code resumed without returning a background ID")
+    task["agent_id"] = new_background_id
+    hydrate_task(task, match_agent(get_agents(include_completed=True), task))
     save_state(data)
-    emit({"task": task})
+    emit(
+        {
+            "task": task,
+            "visibility": "Claude Code resumed in the background; use attach to enter its live terminal session.",
+            "commands": {
+                "status": manager_command("status", task["id"]),
+                "logs": manager_command("logs", task["id"]),
+                "attach": manager_command("attach", task["id"]),
+            },
+        }
+    )
 
 
 def command_stop(args: argparse.Namespace) -> None:
     data = load_state()
     task = find_task(data, args.task_id)
-    result = run_claude(["stop", task["session_id"]], check=False)
+    result = run_claude(["stop", task_agent_id(task)], check=False)
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "unknown error").strip()
+        detail = sanitize_text(result.stderr or result.stdout or "unknown error")
         raise ManagerError(f"Unable to stop task: {detail}")
     task["status"] = "stopped"
     task["updated_at"] = now()
     task.setdefault("history", []).append({"at": now(), "action": "stop"})
     save_state(data)
-    emit({"task": task, "output": result.stdout.strip()})
+    emit({"task": task, "output": sanitize_text(result.stdout)})
 
 
 def command_attach(args: argparse.Namespace) -> None:
@@ -277,7 +502,7 @@ def command_attach(args: argparse.Namespace) -> None:
     executable = shutil.which(CLAUDE_BIN)
     if not executable:
         raise ManagerError(f"Claude Code executable not found: {CLAUDE_BIN}")
-    command = [executable, "attach", task["session_id"]]
+    command = [executable, "attach", task_agent_id(task)]
     if args.print_only or not (sys.stdin.isatty() and sys.stdout.isatty()):
         emit({"task_id": task["id"], "interactive_required": True, "command": shlex.join(command)})
     os.execv(executable, command)
@@ -287,6 +512,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     doctor = subparsers.add_parser("doctor", help="Check Claude Code readiness")
+    doctor.add_argument(
+        "--probe",
+        action="store_true",
+        help="Make a minimal live model request to verify effective credentials",
+    )
     doctor.set_defaults(func=command_doctor)
     start = subparsers.add_parser("start", help="Start a managed background task")
     start.add_argument("--project", required=True)
