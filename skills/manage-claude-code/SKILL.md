@@ -11,19 +11,14 @@ Use `scripts/claude_task.py` for deterministic session management. It stores a l
 
 ## Check readiness
 
-Run this before the first managed task on a machine:
+Run both checks before the first managed task on a machine:
 
 ```bash
 python3 <skill-dir>/scripts/claude_task.py doctor
-```
-
-If the result reports credential overrides or uncertain connectivity, run the minimal live check before launching work:
-
-```bash
 python3 <skill-dir>/scripts/claude_task.py doctor --probe
 ```
 
-The probe makes one small model request and may incur normal provider usage. Stop and explain the missing prerequisite if Claude Code is absent, unauthenticated, or the probe fails. Do not install, update, change credentials, or log in without a separate user request.
+The live probe is mandatory because `claude auth status` can report a saved login even when a headless background worker cannot refresh it. It makes one small model request and may incur normal provider usage. Run it again after credentials or providers change. Stop and explain the missing prerequisite if Claude Code is absent, unauthenticated, or the probe fails. Do not install, update, change credentials, or log in without a separate user request.
 
 ## Define the delegation
 

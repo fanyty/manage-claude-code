@@ -76,6 +76,8 @@ $HOME/.agents/skills/manage-claude-code
 
 Claude Code 默认以后台任务运行，因此不会自动弹出一个新窗口。每次启动后，Skill 会返回管理任务编号、Claude 后台编号，以及三条可直接使用的命令：查看状态、查看日志、进入 Claude Code 现场。想亲自操作时，让 Codex 执行 `attach`，或在交互式终端运行它给出的连接命令。
 
+首次启动任务前，Skill 会执行一次最小真实请求来验证后台凭证。原因是 `claude auth status` 可能显示已经登录，但后台进程仍可能无法刷新登录信息。验证失败时，Skill 会停止启动并提示用户处理登录，不会把一个无法工作的进程误报为正常开发中。
+
 ## 状态与安全
 
 任务台账默认保存在 `~/.codex/manage-claude-code/tasks.json`，不会写入目标项目。Skill 不使用跳过全部权限的模式，也不将“启动任务”解释为部署、发布或其他外部操作授权。
