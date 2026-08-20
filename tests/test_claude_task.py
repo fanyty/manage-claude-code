@@ -192,6 +192,7 @@ if 'new-tab' in args:
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         return json.loads(result.stdout)
 
+    @unittest.skipIf(os.name == "nt", "macOS terminal lifecycle runs on the macOS CI job")
     def test_full_lifecycle(self):
         doctor = self.run_manager("doctor")
         self.assertTrue(doctor["ready"])
@@ -339,6 +340,12 @@ if 'new-tab' in args:
             Path(resumed["window"]["control_file"]).read_text(encoding="utf-8")
         )
         self.assertEqual(control["agent_id"], "xyz98765")
+
+        status = self.run_manager("status", task_id[:8])
+        self.assertTrue(status["logs"]["available"])
+
+        stopped = self.run_manager("stop", task_id[:8])
+        self.assertEqual(stopped["task"]["status"], "stopped")
 
         calls = [
             json.loads(line)
