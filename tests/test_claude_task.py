@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -59,9 +60,42 @@ print('window 1 of application Terminal')
         self.fake_osascript.chmod(0o755)
         self.fake_settings = self.base / "settings.json"
         self.fake_settings.write_text(
-            json.dumps({"env": {"ANTHROPIC_AUTH_TOKEN": "test-secret"}}),
+            json.dumps(
+                {
+                    "env": {
+                        "ANTHROPIC_AUTH_TOKEN": "test-secret",
+                        "ANTHROPIC_BASE_URL": "https://example.invalid/anthropic",
+                        "ANTHROPIC_MODEL": "deepseek-test",
+                    }
+                }
+            ),
             encoding="utf-8",
         )
+        self.cc_switch_db = self.base / "cc-switch.db"
+        connection = sqlite3.connect(self.cc_switch_db)
+        connection.execute(
+            "CREATE TABLE providers (id TEXT, app_type TEXT, name TEXT, settings_config TEXT, is_current INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO providers VALUES (?, ?, ?, ?, ?)",
+            (
+                "deepseek-test",
+                "claude",
+                "DeepSeek",
+                json.dumps(
+                    {
+                        "env": {
+                            "ANTHROPIC_AUTH_TOKEN": "cc-switch-secret",
+                            "ANTHROPIC_BASE_URL": "https://example.invalid/anthropic",
+                            "ANTHROPIC_MODEL": "deepseek-test",
+                        }
+                    }
+                ),
+                1,
+            ),
+        )
+        connection.commit()
+        connection.close()
         self.env = os.environ.copy()
         self.env.update(
             {
@@ -71,6 +105,7 @@ print('window 1 of application Terminal')
                 "FAKE_OSASCRIPT_CALLS": str(self.osascript_calls),
                 "CLAUDE_MANAGER_OSASCRIPT_BIN": str(self.fake_osascript),
                 "CLAUDE_MANAGER_SETTINGS_FILE": str(self.fake_settings),
+                "CLAUDE_MANAGER_CC_SWITCH_DB": str(self.cc_switch_db),
                 "FAKE_AGENTS": json.dumps(
                     [
                         {
@@ -104,9 +139,12 @@ print('window 1 of application Terminal')
         self.assertTrue(doctor["ready"])
         self.assertEqual(
             doctor["credential_override_sources"]["user_settings"],
-            ["ANTHROPIC_AUTH_TOKEN"],
+            ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"],
         )
         self.assertNotIn("test-secret", json.dumps(doctor))
+        self.assertNotIn("cc-switch-secret", json.dumps(doctor))
+        self.assertEqual(doctor["provider"]["name"], "DeepSeek")
+        self.assertTrue(doctor["provider"]["settings_sync"])
 
         probe = self.run_manager("doctor", "--probe")
         self.assertTrue(probe["live_probe"]["ok"])
@@ -132,12 +170,14 @@ print('window 1 of application Terminal')
             "abc12345-1111-2222-3333-444444444444",
         )
         self.assertEqual(started["task"]["deployment_scope"], "test")
+        self.assertEqual(started["task"]["provider"]["source"], "cc-switch")
         self.assertTrue(started["window"]["opened"])
         osascript_calls = self.osascript_calls.read_text(encoding="utf-8")
         self.assertIn("attach abc12345", osascript_calls)
         self.assertIn('settings set \\\"Pro\\\"', osascript_calls)
         claude_calls = self.calls.read_text(encoding="utf-8")
         self.assertIn('\\"theme\\": \\"dark\\"', claude_calls)
+        self.assertIn("--setting-sources", claude_calls)
 
         listing = self.run_manager("list")
         self.assertEqual(len(listing["tasks"]), 1)

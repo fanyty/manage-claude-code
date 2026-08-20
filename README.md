@@ -17,6 +17,7 @@
 - 要求 Codex在汇报完成前独立检查结果
 - 支持无部署、测试环境和明确授权的正式环境三种范围
 - 检测可能覆盖 Claude 登录的环境凭据，并可执行最小连通性探测
+- 自动使用 CC Switch 当前选中的 Claude 供应商，凭证只传给子进程且不会写入日志或任务台账
 
 ## 工作方式
 
@@ -82,6 +83,10 @@ $HOME/.agents/skills/manage-claude-code
 首次启动任务前，Skill 会执行一次最小真实请求来验证后台凭证。原因是 `claude auth status` 可能显示已经登录，但后台进程仍可能无法刷新登录信息。验证失败时，Skill 会停止启动并提示用户处理登录，不会把一个无法工作的进程误报为正常开发中。
 
 诊断同时检查当前进程和 `~/.claude/settings.json` 中可能覆盖登录的变量，只显示变量名，不会输出 API Key 或 Token 内容。这可以识别“OAuth 显示已登录，但自定义服务 Token 已失效”的情况。
+
+如果本机安装了 CC Switch，Skill 的 `auto` 模式会从只读数据库获取当前选中的 Claude 供应商，例如 DeepSeek，并核对它是否与 `~/.claude/settings.json` 里真正落盘的模型和地址一致。两者不一致时拒绝启动后台任务并提示重新启用供应商，避免任务台账写着 DeepSeek、实际窗口却运行 Kimi。凭证不会写入日志或任务台账。
+
+Claude Code 的后台 daemon 会继承启动时的供应商配置。首次启动 CC Switch 任务且没有其他活跃后台任务时，Skill 会先重启这个临时 daemon，防止它继续沿用之前的 Kimi、DeepSeek 或其他供应商；若存在其他活跃任务则不会强行重启。
 
 ## 状态与安全
 

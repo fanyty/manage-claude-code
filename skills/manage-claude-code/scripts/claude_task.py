@@ -9,6 +9,7 @@ import os
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,9 @@ CLAUDE_SETTINGS_FILE = Path(
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 OSASCRIPT_BIN = os.environ.get("CLAUDE_MANAGER_OSASCRIPT_BIN")
 TERMINAL_PROFILE = os.environ.get("CLAUDE_MANAGER_TERMINAL_PROFILE", "Pro")
+CC_SWITCH_DB = Path(
+    os.environ.get("CLAUDE_MANAGER_CC_SWITCH_DB", str(Path.home() / ".cc-switch" / "cc-switch.db"))
+).expanduser()
 PERMISSION_MODES = ("auto", "manual", "acceptEdits", "plan", "dontAsk")
 DEPLOYMENT_SCOPES = ("none", "test", "production")
 TERMINAL_STATES = {"completed", "failed", "stopped", "exited", "done"}
@@ -88,10 +92,14 @@ def run_claude(
     cwd: Path | None = None,
     check: bool = True,
     timeout: float | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     executable = shutil.which(CLAUDE_BIN)
     if not executable:
         raise ManagerError(f"Claude Code executable not found: {CLAUDE_BIN}")
+    command_env = os.environ.copy()
+    if env_overrides:
+        command_env.update(env_overrides)
     try:
         result = subprocess.run(
             [executable, *args],
@@ -100,6 +108,7 @@ def run_claude(
             capture_output=True,
             check=False,
             timeout=timeout,
+            env=command_env,
         )
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
@@ -304,6 +313,115 @@ def configured_overrides() -> dict[str, list[str]]:
     return {"process": process, "user_settings": settings}
 
 
+def claude_user_provider() -> dict[str, str | None]:
+    if not CLAUDE_SETTINGS_FILE.exists():
+        return {"model": None, "base_url": None}
+    try:
+        payload = json.loads(CLAUDE_SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"model": None, "base_url": None}
+    configured_env = payload.get("env", {}) if isinstance(payload, dict) else {}
+    if not isinstance(configured_env, dict):
+        return {"model": None, "base_url": None}
+    return {
+        "model": configured_env.get("ANTHROPIC_MODEL"),
+        "base_url": configured_env.get("ANTHROPIC_BASE_URL"),
+    }
+
+
+def cc_switch_provider() -> dict[str, Any] | None:
+    if not CC_SWITCH_DB.exists():
+        return None
+    try:
+        connection = sqlite3.connect(f"file:{CC_SWITCH_DB}?mode=ro", uri=True)
+        row = connection.execute(
+            "SELECT id, name, settings_config FROM providers "
+            "WHERE app_type='claude' AND is_current=1 LIMIT 1"
+        ).fetchone()
+        connection.close()
+    except sqlite3.Error as exc:
+        raise ManagerError(f"Cannot read CC Switch provider database: {exc}") from exc
+    if not row:
+        return None
+    provider_id, name, raw_config = row
+    try:
+        config = json.loads(raw_config)
+    except json.JSONDecodeError as exc:
+        raise ManagerError(f"CC Switch provider {name} has invalid configuration JSON") from exc
+    configured_env = config.get("env", {}) if isinstance(config, dict) else {}
+    env = {
+        str(key): value
+        for key, value in configured_env.items()
+        if isinstance(key, str) and isinstance(value, str)
+    } if isinstance(configured_env, dict) else {}
+    provider = {
+        "source": "cc-switch",
+        "id": str(provider_id),
+        "name": str(name),
+        "model": env.get("ANTHROPIC_MODEL"),
+        "base_url": env.get("ANTHROPIC_BASE_URL"),
+        "env": env,
+    }
+    applied = claude_user_provider()
+    provider["settings_sync"] = (
+        applied["model"] == provider["model"]
+        and applied["base_url"] == provider["base_url"]
+    )
+    return provider
+
+
+def resolve_provider(source: str) -> dict[str, Any]:
+    if source in {"auto", "cc-switch"}:
+        provider = cc_switch_provider()
+        if provider:
+            return provider
+        if source == "cc-switch":
+            raise ManagerError("CC Switch has no current Claude provider")
+    return {
+        "source": "claude",
+        "id": None,
+        "name": "Claude user settings",
+        "model": None,
+        "base_url": None,
+        "env": {},
+        "settings_sync": True,
+    }
+
+
+def public_provider(provider: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: provider.get(key)
+        for key in ("source", "id", "name", "model", "base_url", "settings_sync")
+    }
+
+
+def provider_cli_args(provider: dict[str, Any]) -> list[str]:
+    if provider["source"] == "cc-switch":
+        return ["--setting-sources", "project,local"]
+    return []
+
+
+def prepare_background_daemon(
+    provider: dict[str, Any],
+    data: dict[str, Any],
+    agents: list[dict[str, Any]],
+) -> None:
+    if provider["source"] != "cc-switch":
+        return
+    active_agents = [
+        agent for agent in agents if agent_status(agent).lower() not in TERMINAL_STATES
+    ]
+    recorded = data.get("daemon_provider", {})
+    if active_agents:
+        if recorded.get("id") != provider.get("id"):
+            raise ManagerError(
+                "Claude's background daemon is already serving active sessions from an unknown or different provider. "
+                "Stop those sessions before switching to the current CC Switch provider."
+            )
+        return
+    run_claude(["daemon", "stop", "--any"], check=False)
+
+
 def command_doctor(args: argparse.Namespace) -> None:
     executable = shutil.which(CLAUDE_BIN)
     if not executable:
@@ -318,18 +436,17 @@ def command_doctor(args: argparse.Namespace) -> None:
     overrides = sorted(set(override_sources["process"] + override_sources["user_settings"]))
     probe_payload: dict[str, Any] | None = None
     ready = auth.returncode == 0
+    provider = resolve_provider(args.provider_source)
     if args.probe:
+        probe_command = provider_cli_args(provider) + ["-p", "--permission-mode", "plan"]
+        if provider["source"] == "claude":
+            probe_command.extend(["--max-budget-usd", "0.02"])
+        probe_command.append("Reply exactly READY. Do not use tools.")
         probe = run_claude(
-            [
-                "-p",
-                "--permission-mode",
-                "plan",
-                "--max-budget-usd",
-                "0.02",
-                "Reply exactly READY. Do not use tools.",
-            ],
+            probe_command,
             check=False,
             timeout=60,
+            env_overrides=provider["env"],
         )
         probe_payload = {
             "ok": probe.returncode == 0,
@@ -338,7 +455,12 @@ def command_doctor(args: argparse.Namespace) -> None:
         }
         ready = ready and probe.returncode == 0
     warning = None
-    if overrides and not args.probe:
+    if provider["source"] == "cc-switch" and not provider["settings_sync"]:
+        warning = (
+            "CC Switch's current provider is not applied to Claude user settings. "
+            "Re-enable that provider in CC Switch before starting a background task."
+        )
+    elif overrides and not args.probe:
         warning = (
             "Environment credentials may override the reported login. "
             "Run doctor --probe to verify a real request."
@@ -354,6 +476,7 @@ def command_doctor(args: argparse.Namespace) -> None:
             "credential_override_sources": override_sources,
             "live_probe": probe_payload,
             "warning": warning,
+            "provider": public_provider(provider),
             "state_file": str(STATE_FILE),
         },
         0 if ready else 1,
@@ -394,6 +517,7 @@ def command_start(args: argparse.Namespace) -> None:
         raise ManagerError(f"Project directory does not exist: {project}")
     data = load_state()
     agents = get_agents(include_completed=False)
+    provider = resolve_provider(args.provider_source)
     for task in data["tasks"]:
         if task.get("project") != str(project):
             continue
@@ -401,13 +525,19 @@ def command_start(args: argparse.Namespace) -> None:
         if active_agent and agent_status(active_agent).lower() not in TERMINAL_STATES:
             raise ManagerError(f"Project already has an active managed task: {task['id']} ({agent_status(active_agent)})")
     manager_id = str(uuid.uuid4())
-    command = ["--background", "--name", args.title, "--permission-mode", args.permission_mode]
+    if provider["source"] == "cc-switch" and not provider["settings_sync"]:
+        raise ManagerError(
+            "CC Switch's current Claude provider does not match ~/.claude/settings.json. "
+            "Re-enable the intended provider in CC Switch, then run doctor --probe again."
+        )
+    prepare_background_daemon(provider, data, agents)
+    command = provider_cli_args(provider) + ["--background", "--name", args.title, "--permission-mode", args.permission_mode]
     if args.open_window:
         command.extend(["--settings", json.dumps({"theme": "dark"})])
     if args.model:
         command.extend(["--model", args.model])
     command.append(build_prompt(args))
-    result = run_claude(command, cwd=project)
+    result = run_claude(command, cwd=project, env_overrides=provider["env"])
     background_id = parse_background_id(result.stdout or result.stderr)
     if not background_id:
         raise ManagerError(
@@ -425,6 +555,7 @@ def command_start(args: argparse.Namespace) -> None:
         "deployment_scope": args.deployment_scope,
         "permission_mode": args.permission_mode,
         "model": args.model,
+        "provider": public_provider(provider),
         "status": "started",
         "created_at": now(),
         "updated_at": now(),
@@ -434,6 +565,7 @@ def command_start(args: argparse.Namespace) -> None:
     current = match_agent(get_agents(include_completed=True), task)
     hydrate_task(task, current)
     data["tasks"].append(task)
+    data["daemon_provider"] = public_provider(provider)
     save_state(data)
     window: dict[str, Any] | None = None
     if args.open_window:
@@ -541,10 +673,14 @@ def command_resume(args: argparse.Namespace) -> None:
     session_id = str(task.get("session_id") or "")
     if not session_id:
         raise ManagerError(f"No resumable Claude session ID recorded for task {task['id']}")
-    command = ["--background", "--resume", session_id, "--permission-mode", args.permission_mode or task.get("permission_mode", "auto"), args.instruction]
+    saved_provider = task.get("provider", {})
+    provider_source = str(saved_provider.get("source") or "auto")
+    provider = resolve_provider(provider_source)
+    command = provider_cli_args(provider)
     if args.open_window:
-        command[1:1] = ["--settings", json.dumps({"theme": "dark"})]
-    result = run_claude(command, cwd=Path(task["project"]))
+        command.extend(["--settings", json.dumps({"theme": "dark"})])
+    command.extend(["--background", "--resume", session_id, "--permission-mode", args.permission_mode or task.get("permission_mode", "auto"), args.instruction])
+    result = run_claude(command, cwd=Path(task["project"]), env_overrides=provider["env"])
     task.setdefault("history", []).append({"at": now(), "action": "resume", "instruction": args.instruction})
     task["status"] = "resumed"
     task["updated_at"] = now()
@@ -619,6 +755,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Make a minimal live model request to verify effective credentials",
     )
+    doctor.add_argument(
+        "--provider-source",
+        choices=("auto", "claude", "cc-switch"),
+        default="auto",
+        help="Choose Claude's user settings or the current CC Switch provider",
+    )
     doctor.set_defaults(func=command_doctor)
     start = subparsers.add_parser("start", help="Start a managed background task")
     start.add_argument("--project", required=True)
@@ -628,6 +770,12 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--deployment-scope", choices=DEPLOYMENT_SCOPES, default="none")
     start.add_argument("--permission-mode", choices=PERMISSION_MODES, default="auto")
     start.add_argument("--model")
+    start.add_argument(
+        "--provider-source",
+        choices=("auto", "claude", "cc-switch"),
+        default="auto",
+        help="Choose Claude's user settings or the current CC Switch provider",
+    )
     start.add_argument(
         "--open-window",
         action="store_true",
