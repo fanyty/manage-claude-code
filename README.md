@@ -13,6 +13,7 @@
 - 恢复已停止或已完成的会话
 - 输出可供用户进入 Claude Code 的连接命令
 - 启动后明确提示 Claude Code 正在后台运行，并同时给出状态、日志和进入现场的命令
+- 在 macOS 上自动打开 Terminal 窗口并进入 Claude Code 现场，同时保留 Codex 后台追踪
 - 要求 Codex在汇报完成前独立检查结果
 - 支持无部署、测试环境和明确授权的正式环境三种范围
 - 检测可能覆盖 Claude 登录的环境凭据，并可执行最小连通性探测
@@ -74,7 +75,9 @@ $HOME/.agents/skills/manage-claude-code
 使用 $manage-claude-code 让 Claude Code 修复验收中发现的问题。
 ```
 
-Claude Code 默认以后台任务运行，因此不会自动弹出一个新窗口。每次启动后，Skill 会返回管理任务编号、Claude 后台编号，以及三条可直接使用的命令：查看状态、查看日志、进入 Claude Code 现场。想亲自操作时，让 Codex 执行 `attach`，或在交互式终端运行它给出的连接命令。
+在 macOS 上，Skill 默认使用 `--open-window`：Claude Code 仍作为后台任务运行，Codex 可以继续追踪；同时系统会打开一个 Terminal 新窗口并自动进入 Claude Code 现场。每次启动后，Skill 会返回管理任务编号、Claude 后台编号，以及查看状态、查看日志、当前终端连接和打开新窗口的命令。窗口被关闭后，也可以让 Codex 再次执行 `open-window`。
+
+第一次打开窗口时，macOS 可能询问是否允许 Codex（或其 Python 进程）控制 Terminal，需要点击允许。若没有授权，Skill 会在等待 20 秒后返回清楚的权限提示，后台 Claude 任务不会因此丢失。
 
 首次启动任务前，Skill 会执行一次最小真实请求来验证后台凭证。原因是 `claude auth status` 可能显示已经登录，但后台进程仍可能无法刷新登录信息。验证失败时，Skill 会停止启动并提示用户处理登录，不会把一个无法工作的进程误报为正常开发中。
 

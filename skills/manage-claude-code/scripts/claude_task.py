@@ -21,6 +21,7 @@ from typing import Any
 STATE_DIR = Path(os.environ.get("CLAUDE_MANAGER_STATE_DIR", str(Path.home() / ".codex" / "manage-claude-code"))).expanduser()
 STATE_FILE = STATE_DIR / "tasks.json"
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
+OSASCRIPT_BIN = os.environ.get("CLAUDE_MANAGER_OSASCRIPT_BIN")
 PERMISSION_MODES = ("auto", "manual", "acceptEdits", "plan", "dontAsk")
 DEPLOYMENT_SCOPES = ("none", "test", "production")
 TERMINAL_STATES = {"completed", "failed", "stopped", "exited", "done"}
@@ -129,6 +130,48 @@ def parse_background_id(output: str) -> str:
 
 def manager_command(*args: str) -> str:
     return shlex.join([sys.executable, str(Path(__file__).resolve()), *args])
+
+
+def open_terminal_window(task: dict[str, Any]) -> dict[str, Any]:
+    if sys.platform != "darwin" and not OSASCRIPT_BIN:
+        raise ManagerError("Opening a new Terminal window is currently supported only on macOS")
+    osascript = shutil.which(OSASCRIPT_BIN or "osascript")
+    executable = shutil.which(CLAUDE_BIN)
+    if not osascript:
+        raise ManagerError("macOS osascript executable not found")
+    if not executable:
+        raise ManagerError(f"Claude Code executable not found: {CLAUDE_BIN}")
+    attach_command = shlex.join([executable, "attach", task_agent_id(task)])
+    script = "\n".join(
+        [
+            'tell application "Terminal"',
+            "activate",
+            f"do script {json.dumps(attach_command)}",
+            "end tell",
+        ]
+    )
+    try:
+        result = subprocess.run(
+            [osascript, "-e", script],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ManagerError(
+            "Timed out waiting for macOS to open Terminal. "
+            "Allow the automation request in System Settings > Privacy & Security > Automation, then retry."
+        ) from exc
+    if result.returncode != 0:
+        detail = sanitize_text(result.stderr or result.stdout or "unknown error")
+        raise ManagerError(f"Unable to open Terminal window: {detail}")
+    return {
+        "opened": True,
+        "application": "Terminal",
+        "attach_command": attach_command,
+        "output": sanitize_text(result.stdout),
+    }
 
 
 def find_task(data: dict[str, Any], task_id: str) -> dict[str, Any]:
@@ -364,15 +407,27 @@ def command_start(args: argparse.Namespace) -> None:
     hydrate_task(task, current)
     data["tasks"].append(task)
     save_state(data)
+    window: dict[str, Any] | None = None
+    if args.open_window:
+        try:
+            window = open_terminal_window(task)
+        except ManagerError as exc:
+            window = {"opened": False, "error": str(exc)}
     emit(
         {
             "task": task,
             "native_agent": current,
-            "visibility": "Claude Code is running in the background; use attach to enter its live terminal session.",
+            "window": window,
+            "visibility": (
+                "Claude Code is running in the background and attached in a visible Terminal window."
+                if window and window.get("opened")
+                else "Claude Code is running in the background; use open-window or attach to enter its live terminal session."
+            ),
             "commands": {
                 "status": manager_command("status", manager_id),
                 "logs": manager_command("logs", manager_id),
                 "attach": manager_command("attach", manager_id),
+                "open_window": manager_command("open-window", manager_id),
             },
         }
     )
@@ -470,14 +525,26 @@ def command_resume(args: argparse.Namespace) -> None:
     task["agent_id"] = new_background_id
     hydrate_task(task, match_agent(get_agents(include_completed=True), task))
     save_state(data)
+    window: dict[str, Any] | None = None
+    if args.open_window:
+        try:
+            window = open_terminal_window(task)
+        except ManagerError as exc:
+            window = {"opened": False, "error": str(exc)}
     emit(
         {
             "task": task,
-            "visibility": "Claude Code resumed in the background; use attach to enter its live terminal session.",
+            "window": window,
+            "visibility": (
+                "Claude Code resumed in the background and attached in a visible Terminal window."
+                if window and window.get("opened")
+                else "Claude Code resumed in the background; use open-window or attach to enter its live terminal session."
+            ),
             "commands": {
                 "status": manager_command("status", task["id"]),
                 "logs": manager_command("logs", task["id"]),
                 "attach": manager_command("attach", task["id"]),
+                "open_window": manager_command("open-window", task["id"]),
             },
         }
     )
@@ -508,6 +575,11 @@ def command_attach(args: argparse.Namespace) -> None:
     os.execv(executable, command)
 
 
+def command_open_window(args: argparse.Namespace) -> None:
+    task = find_task(load_state(), args.task_id)
+    emit({"task_id": task["id"], "window": open_terminal_window(task)})
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -526,6 +598,11 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--deployment-scope", choices=DEPLOYMENT_SCOPES, default="none")
     start.add_argument("--permission-mode", choices=PERMISSION_MODES, default="auto")
     start.add_argument("--model")
+    start.add_argument(
+        "--open-window",
+        action="store_true",
+        help="Open macOS Terminal and attach to the new Claude Code task",
+    )
     start.set_defaults(func=command_start)
     listing = subparsers.add_parser("list", help="List managed tasks")
     listing.set_defaults(func=command_list)
@@ -541,6 +618,11 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("task_id")
     resume.add_argument("--instruction", required=True)
     resume.add_argument("--permission-mode", choices=PERMISSION_MODES)
+    resume.add_argument(
+        "--open-window",
+        action="store_true",
+        help="Open macOS Terminal and attach to the resumed Claude Code task",
+    )
     resume.set_defaults(func=command_resume)
     stop = subparsers.add_parser("stop", help="Stop a background task")
     stop.add_argument("task_id")
@@ -549,6 +631,12 @@ def build_parser() -> argparse.ArgumentParser:
     attach.add_argument("task_id")
     attach.add_argument("--print-only", action="store_true")
     attach.set_defaults(func=command_attach)
+    open_window = subparsers.add_parser(
+        "open-window",
+        help="Open macOS Terminal and attach to a managed task",
+    )
+    open_window.add_argument("task_id")
+    open_window.set_defaults(func=command_open_window)
     return parser
 
 

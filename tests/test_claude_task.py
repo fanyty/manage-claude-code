@@ -18,6 +18,7 @@ class ClaudeTaskTests(unittest.TestCase):
         self.project = self.base / "project"
         self.project.mkdir()
         self.calls = self.base / "calls.jsonl"
+        self.osascript_calls = self.base / "osascript-calls.jsonl"
         self.fake = self.base / "claude"
         self.fake.write_text(
             """#!/usr/bin/env python3
@@ -45,12 +46,25 @@ else:
             encoding="utf-8",
         )
         self.fake.chmod(0o755)
+        self.fake_osascript = self.base / "osascript"
+        self.fake_osascript.write_text(
+            """#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ['FAKE_OSASCRIPT_CALLS'], 'a', encoding='utf-8') as f:
+    f.write(json.dumps(sys.argv[1:]) + '\\n')
+print('window 1 of application Terminal')
+""",
+            encoding="utf-8",
+        )
+        self.fake_osascript.chmod(0o755)
         self.env = os.environ.copy()
         self.env.update(
             {
                 "CLAUDE_BIN": str(self.fake),
                 "CLAUDE_MANAGER_STATE_DIR": str(self.base / "state"),
                 "FAKE_CALLS": str(self.calls),
+                "FAKE_OSASCRIPT_CALLS": str(self.osascript_calls),
+                "CLAUDE_MANAGER_OSASCRIPT_BIN": str(self.fake_osascript),
                 "FAKE_AGENTS": json.dumps(
                     [
                         {
@@ -98,6 +112,7 @@ else:
             "Tests pass and a preview is available",
             "--deployment-scope",
             "test",
+            "--open-window",
         )
         task_id = started["task"]["id"]
         self.assertEqual(started["task"]["agent_id"], "abc12345")
@@ -106,6 +121,9 @@ else:
             "abc12345-1111-2222-3333-444444444444",
         )
         self.assertEqual(started["task"]["deployment_scope"], "test")
+        self.assertTrue(started["window"]["opened"])
+        osascript_calls = self.osascript_calls.read_text(encoding="utf-8")
+        self.assertIn("attach abc12345", osascript_calls)
 
         listing = self.run_manager("list")
         self.assertEqual(len(listing["tasks"]), 1)
@@ -118,10 +136,18 @@ else:
         attachment = self.run_manager("attach", task_id[:8], "--print-only")
         self.assertIn("attach abc12345", attachment["command"])
 
+        opened = self.run_manager("open-window", task_id[:8])
+        self.assertTrue(opened["window"]["opened"])
+
         resumed = self.run_manager(
-            "resume", task_id[:8], "--instruction", "Fix the final check"
+            "resume",
+            task_id[:8],
+            "--instruction",
+            "Fix the final check",
+            "--open-window",
         )
         self.assertEqual(resumed["task"]["status"], "resumed")
+        self.assertTrue(resumed["window"]["opened"])
 
         stopped = self.run_manager("stop", task_id[:8])
         self.assertEqual(stopped["task"]["status"], "stopped")

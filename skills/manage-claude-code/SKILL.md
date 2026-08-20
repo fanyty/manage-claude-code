@@ -42,12 +42,15 @@ python3 <skill-dir>/scripts/claude_task.py start \
   --title "Short task name" \
   --goal "Business outcome and required work" \
   --done "Observable checks proving completion" \
-  --deployment-scope none
+  --deployment-scope none \
+  --open-window
 ```
 
 Set `--deployment-scope test` or `production` only when the user explicitly authorizes that scope for this task. The default permission mode is `auto`; use `manual`, `acceptEdits`, or `plan` when the user asks for tighter control.
 
-Claude Code starts as a background process, so it does not open a separate visible window. Immediately tell the user this, return the manager task ID and native Claude background ID, and show the exact `status`, `logs`, and `attach` commands emitted by the script. If the user wants to watch or operate Claude Code directly, run `attach` from an interactive terminal. Do not claim that a successfully started process has completed the work.
+On macOS, use `--open-window` by default unless the user asks for background-only operation. This preserves Codex tracking while opening Terminal and attaching it to the Claude Code session so the user can watch and operate it. Immediately return the manager task ID and native Claude background ID. If the window could not be opened, report the `window.error` and show the emitted `open_window` and `attach` commands. Do not claim that a successfully started process has completed the work.
+
+The first visible launch may trigger a macOS Automation permission prompt. Tell the user to allow Codex or its Python process to control Terminal. If permission is denied or the request times out, keep the background task intact and retry `open-window` only after the user grants permission.
 
 ## Track and report
 
@@ -82,6 +85,12 @@ When the user wants hands-on control, print or run the attachment command:
 python3 <skill-dir>/scripts/claude_task.py attach <task-id>
 ```
 
+On macOS, open a new visible Terminal window without taking over Codex's terminal:
+
+```bash
+python3 <skill-dir>/scripts/claude_task.py open-window <task-id>
+```
+
 Attaching requires an interactive terminal. After the user changes the task directly in Claude Code, re-read its status and logs, then update Codex's understanding before verifying against the latest goal.
 
 ## Continue or stop work
@@ -90,7 +99,8 @@ Resume a completed or stopped Claude Code session with a follow-up instruction:
 
 ```bash
 python3 <skill-dir>/scripts/claude_task.py resume <task-id> \
-  --instruction "Address the failed check and rerun verification"
+  --instruction "Address the failed check and rerun verification" \
+  --open-window
 ```
 
 Do not resume a session that is still actively running; attach to it or wait. Stop a task only when the user requests it or when continuing would exceed an agreed safety boundary:
