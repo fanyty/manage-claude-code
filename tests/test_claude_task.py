@@ -57,6 +57,11 @@ print('window 1 of application Terminal')
             encoding="utf-8",
         )
         self.fake_osascript.chmod(0o755)
+        self.fake_settings = self.base / "settings.json"
+        self.fake_settings.write_text(
+            json.dumps({"env": {"ANTHROPIC_AUTH_TOKEN": "test-secret"}}),
+            encoding="utf-8",
+        )
         self.env = os.environ.copy()
         self.env.update(
             {
@@ -65,6 +70,7 @@ print('window 1 of application Terminal')
                 "FAKE_CALLS": str(self.calls),
                 "FAKE_OSASCRIPT_CALLS": str(self.osascript_calls),
                 "CLAUDE_MANAGER_OSASCRIPT_BIN": str(self.fake_osascript),
+                "CLAUDE_MANAGER_SETTINGS_FILE": str(self.fake_settings),
                 "FAKE_AGENTS": json.dumps(
                     [
                         {
@@ -96,6 +102,11 @@ print('window 1 of application Terminal')
     def test_full_lifecycle(self):
         doctor = self.run_manager("doctor")
         self.assertTrue(doctor["ready"])
+        self.assertEqual(
+            doctor["credential_override_sources"]["user_settings"],
+            ["ANTHROPIC_AUTH_TOKEN"],
+        )
+        self.assertNotIn("test-secret", json.dumps(doctor))
 
         probe = self.run_manager("doctor", "--probe")
         self.assertTrue(probe["live_probe"]["ok"])
@@ -124,6 +135,9 @@ print('window 1 of application Terminal')
         self.assertTrue(started["window"]["opened"])
         osascript_calls = self.osascript_calls.read_text(encoding="utf-8")
         self.assertIn("attach abc12345", osascript_calls)
+        self.assertIn('settings set \\\"Pro\\\"', osascript_calls)
+        claude_calls = self.calls.read_text(encoding="utf-8")
+        self.assertIn('\\"theme\\": \\"dark\\"', claude_calls)
 
         listing = self.run_manager("list")
         self.assertEqual(len(listing["tasks"]), 1)

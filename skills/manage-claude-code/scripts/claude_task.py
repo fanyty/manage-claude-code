@@ -20,13 +20,20 @@ from typing import Any
 
 STATE_DIR = Path(os.environ.get("CLAUDE_MANAGER_STATE_DIR", str(Path.home() / ".codex" / "manage-claude-code"))).expanduser()
 STATE_FILE = STATE_DIR / "tasks.json"
+CLAUDE_SETTINGS_FILE = Path(
+    os.environ.get("CLAUDE_MANAGER_SETTINGS_FILE", str(Path.home() / ".claude" / "settings.json"))
+).expanduser()
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 OSASCRIPT_BIN = os.environ.get("CLAUDE_MANAGER_OSASCRIPT_BIN")
+TERMINAL_PROFILE = os.environ.get("CLAUDE_MANAGER_TERMINAL_PROFILE", "Pro")
 PERMISSION_MODES = ("auto", "manual", "acceptEdits", "plan", "dontAsk")
 DEPLOYMENT_SCOPES = ("none", "test", "production")
 TERMINAL_STATES = {"completed", "failed", "stopped", "exited", "done"}
 CREDENTIAL_OVERRIDE_VARS = (
     "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_MODEL",
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",
@@ -147,6 +154,7 @@ def open_terminal_window(task: dict[str, Any]) -> dict[str, Any]:
             'tell application "Terminal"',
             "activate",
             f"do script {json.dumps(attach_command)}",
+            f"set current settings of selected tab of front window to settings set {json.dumps(TERMINAL_PROFILE)}",
             "end tell",
         ]
     )
@@ -280,6 +288,22 @@ def task_agent_id(task: dict[str, Any]) -> str:
     return value
 
 
+def configured_overrides() -> dict[str, list[str]]:
+    process = [name for name in CREDENTIAL_OVERRIDE_VARS if os.environ.get(name)]
+    settings: list[str] = []
+    if CLAUDE_SETTINGS_FILE.exists():
+        try:
+            payload = json.loads(CLAUDE_SETTINGS_FILE.read_text(encoding="utf-8"))
+            configured_env = payload.get("env", {}) if isinstance(payload, dict) else {}
+            if isinstance(configured_env, dict):
+                settings = [
+                    name for name in CREDENTIAL_OVERRIDE_VARS if configured_env.get(name)
+                ]
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {"process": process, "user_settings": settings}
+
+
 def command_doctor(args: argparse.Namespace) -> None:
     executable = shutil.which(CLAUDE_BIN)
     if not executable:
@@ -290,7 +314,8 @@ def command_doctor(args: argparse.Namespace) -> None:
         auth_payload: Any = json.loads(auth.stdout) if auth.stdout.strip() else {}
     except json.JSONDecodeError:
         auth_payload = {"raw": sanitize_text(auth.stdout or auth.stderr)}
-    overrides = [name for name in CREDENTIAL_OVERRIDE_VARS if os.environ.get(name)]
+    override_sources = configured_overrides()
+    overrides = sorted(set(override_sources["process"] + override_sources["user_settings"]))
     probe_payload: dict[str, Any] | None = None
     ready = auth.returncode == 0
     if args.probe:
@@ -326,6 +351,7 @@ def command_doctor(args: argparse.Namespace) -> None:
             "authenticated": auth.returncode == 0,
             "auth": auth_payload,
             "credential_override_variables": overrides,
+            "credential_override_sources": override_sources,
             "live_probe": probe_payload,
             "warning": warning,
             "state_file": str(STATE_FILE),
@@ -376,6 +402,8 @@ def command_start(args: argparse.Namespace) -> None:
             raise ManagerError(f"Project already has an active managed task: {task['id']} ({agent_status(active_agent)})")
     manager_id = str(uuid.uuid4())
     command = ["--background", "--name", args.title, "--permission-mode", args.permission_mode]
+    if args.open_window:
+        command.extend(["--settings", json.dumps({"theme": "dark"})])
     if args.model:
         command.extend(["--model", args.model])
     command.append(build_prompt(args))
@@ -514,6 +542,8 @@ def command_resume(args: argparse.Namespace) -> None:
     if not session_id:
         raise ManagerError(f"No resumable Claude session ID recorded for task {task['id']}")
     command = ["--background", "--resume", session_id, "--permission-mode", args.permission_mode or task.get("permission_mode", "auto"), args.instruction]
+    if args.open_window:
+        command[1:1] = ["--settings", json.dumps({"theme": "dark"})]
     result = run_claude(command, cwd=Path(task["project"]))
     task.setdefault("history", []).append({"at": now(), "action": "resume", "instruction": args.instruction})
     task["status"] = "resumed"

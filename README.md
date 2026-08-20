@@ -75,11 +75,13 @@ $HOME/.agents/skills/manage-claude-code
 使用 $manage-claude-code 让 Claude Code 修复验收中发现的问题。
 ```
 
-在 macOS 上，Skill 默认使用 `--open-window`：Claude Code 仍作为后台任务运行，Codex 可以继续追踪；同时系统会打开一个 Terminal 新窗口并自动进入 Claude Code 现场。每次启动后，Skill 会返回管理任务编号、Claude 后台编号，以及查看状态、查看日志、当前终端连接和打开新窗口的命令。窗口被关闭后，也可以让 Codex 再次执行 `open-window`。
+在 macOS 上，Skill 默认使用 `--open-window`：Claude Code 仍作为后台任务运行，Codex 可以继续追踪；同时系统会打开一个 Terminal 新窗口并自动进入 Claude Code 现场。这个窗口使用系统自带的 `Pro` 深色配置，Claude 会话使用深色主题，不会修改 Terminal 的全局默认配置。每次启动后，Skill 会返回管理任务编号、Claude 后台编号，以及查看状态、查看日志、当前终端连接和打开新窗口的命令。窗口被关闭后，也可以让 Codex 再次执行 `open-window`。
 
 第一次打开窗口时，macOS 可能询问是否允许 Codex（或其 Python 进程）控制 Terminal，需要点击允许。若没有授权，Skill 会在等待 20 秒后返回清楚的权限提示，后台 Claude 任务不会因此丢失。
 
 首次启动任务前，Skill 会执行一次最小真实请求来验证后台凭证。原因是 `claude auth status` 可能显示已经登录，但后台进程仍可能无法刷新登录信息。验证失败时，Skill 会停止启动并提示用户处理登录，不会把一个无法工作的进程误报为正常开发中。
+
+诊断同时检查当前进程和 `~/.claude/settings.json` 中可能覆盖登录的变量，只显示变量名，不会输出 API Key 或 Token 内容。这可以识别“OAuth 显示已登录，但自定义服务 Token 已失效”的情况。
 
 ## 状态与安全
 

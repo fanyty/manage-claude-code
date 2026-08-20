@@ -48,7 +48,7 @@ python3 <skill-dir>/scripts/claude_task.py start \
 
 Set `--deployment-scope test` or `production` only when the user explicitly authorizes that scope for this task. The default permission mode is `auto`; use `manual`, `acceptEdits`, or `plan` when the user asks for tighter control.
 
-On macOS, use `--open-window` by default unless the user asks for background-only operation. This preserves Codex tracking while opening Terminal and attaching it to the Claude Code session so the user can watch and operate it. Immediately return the manager task ID and native Claude background ID. If the window could not be opened, report the `window.error` and show the emitted `open_window` and `attach` commands. Do not claim that a successfully started process has completed the work.
+On macOS, use `--open-window` by default unless the user asks for background-only operation. This preserves Codex tracking while opening Terminal with its built-in `Pro` profile, attaching it to the Claude Code session, and applying Claude's dark theme for readable contrast. These choices affect only the managed session window, not the user's global Terminal default. Immediately return the manager task ID and native Claude background ID. If the window could not be opened, report the `window.error` and show the emitted `open_window` and `attach` commands. Do not claim that a successfully started process has completed the work.
 
 The first visible launch may trigger a macOS Automation permission prompt. Tell the user to allow Codex or its Python process to control Terminal. If permission is denied or the request times out, keep the background task intact and retry `open-window` only after the user grants permission.
 
