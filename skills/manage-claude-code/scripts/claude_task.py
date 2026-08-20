@@ -150,7 +150,7 @@ def manager_command(*args: str) -> str:
 
 def open_terminal_window(task: dict[str, Any]) -> dict[str, Any]:
     if sys.platform != "darwin" and not OSASCRIPT_BIN:
-        raise ManagerError("Opening a new Terminal window is currently supported only on macOS")
+        raise ManagerError("Opening or reusing a Terminal window is currently supported only on macOS")
     osascript = shutil.which(OSASCRIPT_BIN or "osascript")
     executable = shutil.which(CLAUDE_BIN)
     if not osascript:
@@ -158,12 +158,39 @@ def open_terminal_window(task: dict[str, Any]) -> dict[str, Any]:
     if not executable:
         raise ManagerError(f"Claude Code executable not found: {CLAUDE_BIN}")
     attach_command = shlex.join([executable, "attach", task_agent_id(task)])
+    saved_window_id = task.get("terminal_window_id")
+    if not isinstance(saved_window_id, int):
+        saved_window_id = 0
     script = "\n".join(
         [
             'tell application "Terminal"',
             "activate",
+            f"set savedWindowId to {saved_window_id}",
+            "set targetWindow to missing value",
+            'set actionName to "created"',
+            "if savedWindowId is not 0 then",
+            "repeat with terminalWindow in windows",
+            "if (id of terminalWindow) is savedWindowId then",
+            "set targetWindow to terminalWindow",
+            "exit repeat",
+            "end if",
+            "end repeat",
+            "end if",
+            "if targetWindow is missing value then",
             f"do script {json.dumps(attach_command)}",
-            f"set current settings of selected tab of front window to settings set {json.dumps(TERMINAL_PROFILE)}",
+            "set targetWindow to front window",
+            "else",
+            "set index of targetWindow to 1",
+            "if busy of selected tab of targetWindow then",
+            'set actionName to "focused"',
+            "else",
+            f"do script {json.dumps(attach_command)} in selected tab of targetWindow",
+            'set actionName to "reused"',
+            "end if",
+            "end if",
+            f"set current settings of selected tab of targetWindow to settings set {json.dumps(TERMINAL_PROFILE)}",
+            "set index of targetWindow to 1",
+            'return (id of targetWindow as text) & "|" & actionName',
             "end tell",
         ]
     )
@@ -183,11 +210,20 @@ def open_terminal_window(task: dict[str, Any]) -> dict[str, Any]:
     if result.returncode != 0:
         detail = sanitize_text(result.stderr or result.stdout or "unknown error")
         raise ManagerError(f"Unable to open Terminal window: {detail}")
+    output = sanitize_text(result.stdout)
+    window_id_text, separator, action = output.partition("|")
+    if not separator or not window_id_text.isdigit():
+        raise ManagerError(f"Terminal opened but its window ID could not be recorded: {output or 'no output'}")
+    window_id = int(window_id_text)
+    task["terminal_window_id"] = window_id
     return {
         "opened": True,
         "application": "Terminal",
+        "window_id": window_id,
+        "action": action,
+        "reused": action in {"reused", "focused"},
         "attach_command": attach_command,
-        "output": sanitize_text(result.stdout),
+        "output": output,
     }
 
 
@@ -571,6 +607,7 @@ def command_start(args: argparse.Namespace) -> None:
     if args.open_window:
         try:
             window = open_terminal_window(task)
+            save_state(data)
         except ManagerError as exc:
             window = {"opened": False, "error": str(exc)}
     emit(
@@ -695,6 +732,7 @@ def command_resume(args: argparse.Namespace) -> None:
     if args.open_window:
         try:
             window = open_terminal_window(task)
+            save_state(data)
         except ManagerError as exc:
             window = {"opened": False, "error": str(exc)}
     emit(
@@ -742,8 +780,11 @@ def command_attach(args: argparse.Namespace) -> None:
 
 
 def command_open_window(args: argparse.Namespace) -> None:
-    task = find_task(load_state(), args.task_id)
-    emit({"task_id": task["id"], "window": open_terminal_window(task)})
+    data = load_state()
+    task = find_task(data, args.task_id)
+    window = open_terminal_window(task)
+    save_state(data)
+    emit({"task_id": task["id"], "window": window})
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -779,7 +820,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument(
         "--open-window",
         action="store_true",
-        help="Open macOS Terminal and attach to the new Claude Code task",
+        help="Open or reuse the task's macOS Terminal window and attach to Claude Code",
     )
     start.set_defaults(func=command_start)
     listing = subparsers.add_parser("list", help="List managed tasks")
@@ -799,7 +840,7 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument(
         "--open-window",
         action="store_true",
-        help="Open macOS Terminal and attach to the resumed Claude Code task",
+        help="Reuse the task's macOS Terminal window and attach to the resumed Claude Code task",
     )
     resume.set_defaults(func=command_resume)
     stop = subparsers.add_parser("stop", help="Stop a background task")
@@ -811,7 +852,7 @@ def build_parser() -> argparse.ArgumentParser:
     attach.set_defaults(func=command_attach)
     open_window = subparsers.add_parser(
         "open-window",
-        help="Open macOS Terminal and attach to a managed task",
+        help="Open or focus the managed task's macOS Terminal window",
     )
     open_window.add_argument("task_id")
     open_window.set_defaults(func=command_open_window)

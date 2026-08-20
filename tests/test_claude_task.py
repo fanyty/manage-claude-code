@@ -53,7 +53,8 @@ else:
 import json, os, sys
 with open(os.environ['FAKE_OSASCRIPT_CALLS'], 'a', encoding='utf-8') as f:
     f.write(json.dumps(sys.argv[1:]) + '\\n')
-print('window 1 of application Terminal')
+payload = ' '.join(sys.argv[1:])
+print('4242|reused' if 'set savedWindowId to 4242' in payload else '4242|created')
 """,
             encoding="utf-8",
         )
@@ -172,6 +173,9 @@ print('window 1 of application Terminal')
         self.assertEqual(started["task"]["deployment_scope"], "test")
         self.assertEqual(started["task"]["provider"]["source"], "cc-switch")
         self.assertTrue(started["window"]["opened"])
+        self.assertEqual(started["window"]["window_id"], 4242)
+        self.assertFalse(started["window"]["reused"])
+        self.assertEqual(started["task"]["terminal_window_id"], 4242)
         osascript_calls = self.osascript_calls.read_text(encoding="utf-8")
         self.assertIn("attach abc12345", osascript_calls)
         self.assertIn('settings set \\\"Pro\\\"', osascript_calls)
@@ -192,6 +196,8 @@ print('window 1 of application Terminal')
 
         opened = self.run_manager("open-window", task_id[:8])
         self.assertTrue(opened["window"]["opened"])
+        self.assertTrue(opened["window"]["reused"])
+        self.assertEqual(opened["window"]["window_id"], 4242)
 
         resumed = self.run_manager(
             "resume",
@@ -202,6 +208,19 @@ print('window 1 of application Terminal')
         )
         self.assertEqual(resumed["task"]["status"], "resumed")
         self.assertTrue(resumed["window"]["opened"])
+        self.assertTrue(resumed["window"]["reused"])
+        self.assertEqual(resumed["task"]["terminal_window_id"], 4242)
+
+        osascript_payloads = [
+            json.loads(line)[1]
+            for line in self.osascript_calls.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(len(osascript_payloads), 3)
+        self.assertIn("set savedWindowId to 0", osascript_payloads[0])
+        self.assertIn("set savedWindowId to 4242", osascript_payloads[1])
+        self.assertIn("set savedWindowId to 4242", osascript_payloads[2])
+        self.assertIn("in selected tab of targetWindow", osascript_payloads[1])
+        self.assertIn("in selected tab of targetWindow", osascript_payloads[2])
 
         stopped = self.run_manager("stop", task_id[:8])
         self.assertEqual(stopped["task"]["status"], "stopped")
@@ -211,6 +230,7 @@ print('window 1 of application Terminal')
         )
         self.assertEqual(len(ledger["tasks"]), 1)
         self.assertEqual(ledger["tasks"][0]["id"], task_id)
+        self.assertEqual(ledger["tasks"][0]["terminal_window_id"], 4242)
 
     def test_migrates_legacy_task_ids(self):
         state_dir = self.base / "state"

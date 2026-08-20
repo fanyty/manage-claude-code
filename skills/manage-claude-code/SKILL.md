@@ -48,7 +48,7 @@ python3 <skill-dir>/scripts/claude_task.py start \
 
 Set `--deployment-scope test` or `production` only when the user explicitly authorizes that scope for this task. The default permission mode is `auto`; use `manual`, `acceptEdits`, or `plan` when the user asks for tighter control.
 
-On macOS, use `--open-window` by default unless the user asks for background-only operation. This preserves Codex tracking while opening Terminal with its built-in `Pro` profile, attaching it to the Claude Code session, and applying Claude's dark theme for readable contrast. These choices affect only the managed session window, not the user's global Terminal default. Immediately return the manager task ID and native Claude background ID. If the window could not be opened, report the `window.error` and show the emitted `open_window` and `attach` commands. Do not claim that a successfully started process has completed the work.
+On macOS, use `--open-window` by default unless the user asks for background-only operation. This preserves Codex tracking while opening one dedicated Terminal window with its built-in `Pro` profile, attaching it to the Claude Code session, and applying Claude's dark theme for readable contrast. The manager records that window and reuses it for later `open-window` and `resume --open-window` commands; it creates a replacement only if the recorded window was closed. These choices affect only the managed session window, not the user's global Terminal default. Immediately return the manager task ID and native Claude background ID. If the window could not be opened, report the `window.error` and show the emitted `open_window` and `attach` commands. Do not claim that a successfully started process has completed the work.
 
 The first visible launch may trigger a macOS Automation permission prompt. Tell the user to allow Codex or its Python process to control Terminal. If permission is denied or the request times out, keep the background task intact and retry `open-window` only after the user grants permission.
 
@@ -85,7 +85,7 @@ When the user wants hands-on control, print or run the attachment command:
 python3 <skill-dir>/scripts/claude_task.py attach <task-id>
 ```
 
-On macOS, open a new visible Terminal window without taking over Codex's terminal:
+On macOS, focus and reuse the task's visible Terminal window without taking over Codex's terminal. If its recorded window has been closed, this command creates one replacement:
 
 ```bash
 python3 <skill-dir>/scripts/claude_task.py open-window <task-id>
