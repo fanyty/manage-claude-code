@@ -13,6 +13,19 @@ MANAGER = ROOT / "skills" / "manage-claude-code" / "scripts" / "claude_task.py"
 
 
 class ClaudeTaskTests(unittest.TestCase):
+    def write_fake_executable(self, name, source):
+        if os.name == "nt":
+            script = self.base / f"{name}.py"
+            script.write_text(source, encoding="utf-8")
+            launcher = self.base / f"{name}.cmd"
+            command = subprocess.list2cmdline([sys.executable, str(script)])
+            launcher.write_text(f"@echo off\r\n{command} %*\r\n", encoding="utf-8")
+            return launcher
+        executable = self.base / name
+        executable.write_text(source, encoding="utf-8")
+        executable.chmod(0o755)
+        return executable
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.base = Path(self.temp.name)
@@ -20,8 +33,10 @@ class ClaudeTaskTests(unittest.TestCase):
         self.project.mkdir()
         self.calls = self.base / "calls.jsonl"
         self.osascript_calls = self.base / "osascript-calls.jsonl"
-        self.fake = self.base / "claude"
-        self.fake.write_text(
+        self.windows_terminal_calls = self.base / "windows-terminal-calls.jsonl"
+        self.powershell_calls = self.base / "powershell-calls.jsonl"
+        self.fake = self.write_fake_executable(
+            "claude",
             """#!/usr/bin/env python3
 import json, os, sys
 args = sys.argv[1:]
@@ -37,6 +52,8 @@ elif args and args[0] == 'logs':
     print('planning\\x1b[31m\\nimplemented feature\\ntests passed\\x1b[0m')
 elif args and args[0] == 'stop':
     print('stopped')
+elif '--background' in args and '--resume' in args:
+    print('backgrounded · xyz98765 · Export customers')
 elif '--background' in args:
     print('backgrounded · abc12345 · Export customers')
 elif '-p' in args:
@@ -44,11 +61,9 @@ elif '-p' in args:
 else:
     print(json.dumps({'args': args}))
 """,
-            encoding="utf-8",
         )
-        self.fake.chmod(0o755)
-        self.fake_osascript = self.base / "osascript"
-        self.fake_osascript.write_text(
+        self.fake_osascript = self.write_fake_executable(
+            "osascript",
             """#!/usr/bin/env python3
 import json, os, sys
 with open(os.environ['FAKE_OSASCRIPT_CALLS'], 'a', encoding='utf-8') as f:
@@ -56,9 +71,41 @@ with open(os.environ['FAKE_OSASCRIPT_CALLS'], 'a', encoding='utf-8') as f:
 payload = ' '.join(sys.argv[1:])
 print('4242|reused' if 'set savedWindowId to 4242' in payload else '4242|created')
 """,
-            encoding="utf-8",
         )
-        self.fake_osascript.chmod(0o755)
+        self.fake_powershell = self.write_fake_executable(
+            "powershell",
+            """#!/usr/bin/env python3
+import json, os, sys, time
+args = sys.argv[1:]
+with open(os.environ['FAKE_POWERSHELL_CALLS'], 'a', encoding='utf-8') as f:
+    f.write(json.dumps(args) + '\\n')
+if '-StatusPath' in args:
+    status = args[args.index('-StatusPath') + 1]
+    bridge_token = args[args.index('-BridgeToken') + 1]
+    with open(status, 'w', encoding='utf-8') as f:
+        json.dump({'pid': os.getpid(), 'state': 'waiting', 'bridge_token': bridge_token}, f)
+    time.sleep(30)
+""",
+        )
+        self.fake_wt = self.write_fake_executable(
+            "wt",
+            """#!/usr/bin/env python3
+import json, os, subprocess, sys
+args = sys.argv[1:]
+with open(os.environ['FAKE_WINDOWS_TERMINAL_CALLS'], 'a', encoding='utf-8') as f:
+    f.write(json.dumps(args) + '\\n')
+if 'new-tab' in args:
+    powershell = os.environ['FAKE_POWERSHELL']
+    index = args.index(powershell)
+    command = [powershell, *args[index + 1:]]
+    subprocess.Popen(
+        subprocess.list2cmdline(command) if os.name == 'nt' else command,
+        shell=os.name == 'nt',
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+""",
+        )
         self.fake_settings = self.base / "settings.json"
         self.fake_settings.write_text(
             json.dumps(
@@ -104,7 +151,11 @@ print('4242|reused' if 'set savedWindowId to 4242' in payload else '4242|created
                 "CLAUDE_MANAGER_STATE_DIR": str(self.base / "state"),
                 "FAKE_CALLS": str(self.calls),
                 "FAKE_OSASCRIPT_CALLS": str(self.osascript_calls),
+                "FAKE_WINDOWS_TERMINAL_CALLS": str(self.windows_terminal_calls),
+                "FAKE_POWERSHELL_CALLS": str(self.powershell_calls),
+                "FAKE_POWERSHELL": str(self.fake_powershell),
                 "CLAUDE_MANAGER_OSASCRIPT_BIN": str(self.fake_osascript),
+                "CLAUDE_MANAGER_PLATFORM": "darwin",
                 "CLAUDE_MANAGER_SETTINGS_FILE": str(self.fake_settings),
                 "CLAUDE_MANAGER_CC_SWITCH_DB": str(self.cc_switch_db),
                 "FAKE_AGENTS": json.dumps(
@@ -122,6 +173,12 @@ print('4242|reused' if 'set savedWindowId to 4242' in payload else '4242|created
         )
 
     def tearDown(self):
+        for status in self.base.glob("*state/windows/*.status.json"):
+            try:
+                pid = json.loads(status.read_text(encoding="utf-8"))["pid"]
+                os.kill(pid, 15)
+            except (OSError, KeyError, json.JSONDecodeError):
+                pass
         self.temp.cleanup()
 
     def run_manager(self, *args):
@@ -231,6 +288,116 @@ print('4242|reused' if 'set savedWindowId to 4242' in payload else '4242|created
         self.assertEqual(len(ledger["tasks"]), 1)
         self.assertEqual(ledger["tasks"][0]["id"], task_id)
         self.assertEqual(ledger["tasks"][0]["terminal_window_id"], 4242)
+
+    def test_windows_uses_one_named_terminal_window(self):
+        self.env.update(
+            {
+                "CLAUDE_MANAGER_PLATFORM": "win32",
+                "CLAUDE_MANAGER_STATE_DIR": str(self.base / "windows-state"),
+                "CLAUDE_MANAGER_WINDOWS_TERMINAL_BIN": str(self.fake_wt),
+                "CLAUDE_MANAGER_POWERSHELL_BIN": str(self.fake_powershell),
+            }
+        )
+        doctor = self.run_manager("doctor", "--probe")
+        self.assertTrue(doctor["ready"])
+        self.assertEqual(doctor["platform"]["name"], "win32")
+        self.assertEqual(doctor["platform"]["visible_terminal"], "Windows Terminal")
+
+        started = self.run_manager(
+            "start",
+            "--project",
+            str(self.project),
+            "--title",
+            "Export customers",
+            "--goal",
+            "Add a customer export",
+            "--done",
+            "Tests pass",
+            "--open-window",
+        )
+        task_id = started["task"]["id"]
+        window_name = started["window"]["window_name"]
+        self.assertEqual(started["window"]["action"], "created")
+        self.assertEqual(started["window"]["application"], "Windows Terminal")
+        self.assertTrue(window_name.startswith("codex-claude-"))
+
+        opened = self.run_manager("open-window", task_id[:8])
+        self.assertTrue(opened["window"]["reused"])
+        self.assertEqual(opened["window"]["action"], "focused")
+        self.assertEqual(opened["window"]["window_name"], window_name)
+
+        resumed = self.run_manager(
+            "resume",
+            task_id[:8],
+            "--instruction",
+            "Run the final check",
+            "--open-window",
+        )
+        self.assertEqual(resumed["task"]["agent_id"], "xyz98765")
+        self.assertTrue(resumed["window"]["reused"])
+        control = json.loads(
+            Path(resumed["window"]["control_file"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(control["agent_id"], "xyz98765")
+
+        calls = [
+            json.loads(line)
+            for line in self.windows_terminal_calls.read_text(encoding="utf-8").splitlines()
+        ]
+        create_calls = [call for call in calls if "new-tab" in call]
+        focus_calls = [call for call in calls if "focus-tab" in call]
+        self.assertEqual(len(create_calls), 1)
+        self.assertEqual(len(focus_calls), 2)
+        self.assertIn(window_name, create_calls[0])
+        self.assertIn(window_name, focus_calls[0])
+
+        ledger = json.loads(
+            (self.base / "windows-state" / "tasks.json").read_text(encoding="utf-8")
+        )
+        task = ledger["tasks"][0]
+        self.assertEqual(task["terminal_window_name"], window_name)
+        self.assertEqual(task["terminal_backend"], "windows-terminal")
+        self.assertGreater(task["terminal_process_id"], 0)
+
+    def test_windows_falls_back_to_one_powershell_window(self):
+        self.env.update(
+            {
+                "CLAUDE_MANAGER_PLATFORM": "win32",
+                "CLAUDE_MANAGER_STATE_DIR": str(self.base / "fallback-state"),
+                "CLAUDE_MANAGER_WINDOWS_TERMINAL_BIN": str(self.base / "missing-wt.exe"),
+                "CLAUDE_MANAGER_POWERSHELL_BIN": str(self.fake_powershell),
+            }
+        )
+        doctor = self.run_manager("doctor")
+        self.assertTrue(doctor["ready"])
+        self.assertEqual(doctor["platform"]["visible_terminal"], "PowerShell")
+        self.assertIn("Windows Terminal was not found", doctor["warning"])
+
+        started = self.run_manager(
+            "start",
+            "--project",
+            str(self.project),
+            "--title",
+            "Export customers",
+            "--goal",
+            "Add a customer export",
+            "--done",
+            "Tests pass",
+            "--open-window",
+        )
+        task_id = started["task"]["id"]
+        self.assertEqual(started["window"]["application"], "PowerShell")
+        self.assertEqual(started["window"]["action"], "created")
+
+        opened = self.run_manager("open-window", task_id[:8])
+        self.assertTrue(opened["window"]["reused"])
+        self.assertEqual(opened["window"]["application"], "PowerShell")
+        bridge_launches = [
+            json.loads(line)
+            for line in self.powershell_calls.read_text(encoding="utf-8").splitlines()
+            if "-StatusPath" in json.loads(line)
+        ]
+        self.assertEqual(len(bridge_launches), 1)
 
     def test_migrates_legacy_task_ids(self):
         state_dir = self.base / "state"

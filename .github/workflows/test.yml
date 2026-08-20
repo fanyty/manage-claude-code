@@ -1,0 +1,35 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  cross-platform:
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - name: Compile manager
+        run: python -m py_compile skills/manage-claude-code/scripts/claude_task.py
+      - name: Run lifecycle tests
+        run: python -m unittest discover -s tests -v
+      - name: Validate PowerShell bridge syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          $path = Resolve-Path skills/manage-claude-code/scripts/windows_terminal_bridge.ps1
+          [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
+      - name: Check patch whitespace
+        run: git diff --check

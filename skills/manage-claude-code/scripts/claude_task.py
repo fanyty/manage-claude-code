@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,15 +22,16 @@ from typing import Any
 
 STATE_DIR = Path(os.environ.get("CLAUDE_MANAGER_STATE_DIR", str(Path.home() / ".codex" / "manage-claude-code"))).expanduser()
 STATE_FILE = STATE_DIR / "tasks.json"
+PLATFORM = os.environ.get("CLAUDE_MANAGER_PLATFORM", sys.platform)
 CLAUDE_SETTINGS_FILE = Path(
     os.environ.get("CLAUDE_MANAGER_SETTINGS_FILE", str(Path.home() / ".claude" / "settings.json"))
 ).expanduser()
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 OSASCRIPT_BIN = os.environ.get("CLAUDE_MANAGER_OSASCRIPT_BIN")
 TERMINAL_PROFILE = os.environ.get("CLAUDE_MANAGER_TERMINAL_PROFILE", "Pro")
-CC_SWITCH_DB = Path(
-    os.environ.get("CLAUDE_MANAGER_CC_SWITCH_DB", str(Path.home() / ".cc-switch" / "cc-switch.db"))
-).expanduser()
+WINDOWS_TERMINAL_BIN = os.environ.get("CLAUDE_MANAGER_WINDOWS_TERMINAL_BIN", "wt.exe")
+POWERSHELL_BIN = os.environ.get("CLAUDE_MANAGER_POWERSHELL_BIN", "powershell.exe")
+CC_SWITCH_DB_OVERRIDE = os.environ.get("CLAUDE_MANAGER_CC_SWITCH_DB")
 PERMISSION_MODES = ("auto", "manual", "acceptEdits", "plan", "dontAsk")
 DEPLOYMENT_SCOPES = ("none", "test", "production")
 TERMINAL_STATES = {"completed", "failed", "stopped", "exited", "done"}
@@ -145,12 +147,11 @@ def parse_background_id(output: str) -> str:
 
 
 def manager_command(*args: str) -> str:
-    return shlex.join([sys.executable, str(Path(__file__).resolve()), *args])
+    command = [sys.executable, str(Path(__file__).resolve()), *args]
+    return subprocess.list2cmdline(command) if PLATFORM == "win32" else shlex.join(command)
 
 
-def open_terminal_window(task: dict[str, Any]) -> dict[str, Any]:
-    if sys.platform != "darwin" and not OSASCRIPT_BIN:
-        raise ManagerError("Opening or reusing a Terminal window is currently supported only on macOS")
+def open_macos_terminal_window(task: dict[str, Any]) -> dict[str, Any]:
     osascript = shutil.which(OSASCRIPT_BIN or "osascript")
     executable = shutil.which(CLAUDE_BIN)
     if not osascript:
@@ -227,6 +228,204 @@ def open_terminal_window(task: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def windows_runtime_paths(task: dict[str, Any]) -> tuple[Path, Path]:
+    runtime_dir = STATE_DIR / "windows"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    task_id = str(task["id"])
+    return runtime_dir / f"{task_id}.control.json", runtime_dir / f"{task_id}.status.json"
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f"{path.stem}-", suffix=".json", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.replace(temp_name, path)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
+def process_is_running(pid: Any) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            process_query_limited_information, False, pid
+        )
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+    except (OSError, ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+def read_bridge_pid(status_path: Path, expected_token: str) -> int | None:
+    try:
+        payload = json.loads(status_path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("bridge_token") != expected_token:
+        return None
+    pid = payload.get("pid")
+    return pid if isinstance(pid, int) and pid > 0 else None
+
+
+def focus_windows_terminal(window_name: str, pid: int, wt: str | None, powershell: str) -> bool:
+    if wt:
+        result = subprocess.run(
+            [wt, "-w", window_name, "focus-tab", "--target", "0"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        return result.returncode == 0
+    focus_script = """
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class CodexWindow {
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+}
+'@
+$p = Get-Process -Id $args[0] -ErrorAction Stop
+if ($p.MainWindowHandle -eq 0) { exit 2 }
+[CodexWindow]::ShowWindowAsync($p.MainWindowHandle, 9) | Out-Null
+if (-not [CodexWindow]::SetForegroundWindow($p.MainWindowHandle)) { exit 3 }
+""".strip()
+    result = subprocess.run(
+        [powershell, "-NoLogo", "-NoProfile", "-Command", focus_script, str(pid)],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    return result.returncode == 0
+
+
+def open_windows_terminal_window(task: dict[str, Any]) -> dict[str, Any]:
+    executable = shutil.which(CLAUDE_BIN)
+    powershell = shutil.which(POWERSHELL_BIN) or shutil.which("pwsh.exe")
+    wt = shutil.which(WINDOWS_TERMINAL_BIN)
+    if not executable:
+        raise ManagerError(f"Claude Code executable not found: {CLAUDE_BIN}")
+    if not powershell:
+        raise ManagerError("PowerShell executable not found; install Windows PowerShell or PowerShell 7")
+    bridge = Path(__file__).with_name("windows_terminal_bridge.ps1")
+    if not bridge.is_file():
+        raise ManagerError(f"Windows terminal bridge is missing: {bridge}")
+
+    control_path, status_path = windows_runtime_paths(task)
+    window_name = str(task.get("terminal_window_name") or f"codex-claude-{str(task['id'])[:8]}")
+    bridge_token = str(task.get("terminal_bridge_token") or uuid.uuid4())
+    task["terminal_window_name"] = window_name
+    task["terminal_bridge_token"] = bridge_token
+    write_json_atomic(
+        control_path,
+        {
+            "task_id": task["id"],
+            "title": task.get("title", "Claude Code task"),
+            "agent_id": task_agent_id(task),
+            "claude_executable": executable,
+            "bridge_token": bridge_token,
+            "updated_at": now(),
+        },
+    )
+
+    pid = read_bridge_pid(status_path, bridge_token)
+    if process_is_running(pid):
+        focused = focus_windows_terminal(window_name, pid, wt, powershell)
+        task["terminal_process_id"] = pid
+        task["terminal_backend"] = "windows-terminal" if wt else "powershell"
+        return {
+            "opened": True,
+            "application": "Windows Terminal" if wt else "PowerShell",
+            "window_name": window_name,
+            "process_id": pid,
+            "action": "focused" if focused else "already-running",
+            "reused": True,
+            "control_file": str(control_path),
+        }
+
+    status_path.unlink(missing_ok=True)
+    bridge_args = [
+        powershell,
+        "-NoLogo",
+        "-NoProfile",
+        "-File",
+        str(bridge),
+        "-ControlPath",
+        str(control_path),
+        "-StatusPath",
+        str(status_path),
+        "-BridgeToken",
+        bridge_token,
+    ]
+    if wt:
+        launch_command = [
+            wt,
+            "-w",
+            window_name,
+            "new-tab",
+            "--title",
+            str(task.get("title") or "Claude Code"),
+            *bridge_args,
+        ]
+        subprocess.Popen(launch_command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        backend = "windows-terminal"
+    else:
+        creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+        subprocess.Popen(
+            bridge_args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+        backend = "powershell"
+
+    deadline = time.monotonic() + 8
+    pid = None
+    while time.monotonic() < deadline:
+        pid = read_bridge_pid(status_path, bridge_token)
+        if process_is_running(pid):
+            break
+        time.sleep(0.1)
+    if not process_is_running(pid):
+        raise ManagerError(
+            "Windows terminal process did not become ready. Check PowerShell execution policy and Windows Terminal."
+        )
+    task["terminal_process_id"] = pid
+    task["terminal_backend"] = backend
+    return {
+        "opened": True,
+        "application": "Windows Terminal" if wt else "PowerShell",
+        "window_name": window_name,
+        "process_id": pid,
+        "action": "created",
+        "reused": False,
+        "control_file": str(control_path),
+    }
+
+
+def open_terminal_window(task: dict[str, Any]) -> dict[str, Any]:
+    if PLATFORM == "darwin":
+        return open_macos_terminal_window(task)
+    if PLATFORM == "win32":
+        return open_windows_terminal_window(task)
+    raise ManagerError("Visible terminal windows are supported on macOS and Windows")
+
+
 def find_task(data: dict[str, Any], task_id: str) -> dict[str, Any]:
     exact = [task for task in data["tasks"] if task.get("id") == task_id]
     if exact:
@@ -275,24 +474,31 @@ def get_agents(include_completed: bool = True) -> list[dict[str, Any]]:
 
 
 def match_agent(agents: list[dict[str, Any]], task: dict[str, Any]) -> dict[str, Any] | None:
-    identifiers = {
-        str(task.get(key, ""))
-        for key in ("agent_id", "session_id", "requested_session_id")
-        if task.get(key)
-    }
+    primary_identifiers = {str(task["agent_id"])} if task.get("agent_id") else set()
     parsed = parse_background_id(str(task.get("launch_output", "")))
     if parsed:
-        identifiers.add(parsed)
-    for agent in agents:
-        native_ids = {value for value in (agent_id(agent), agent_session_id(agent)) if value}
-        for expected in identifiers:
-            if any(
-                native == expected
-                or native.startswith(expected)
-                or expected.startswith(native)
-                for native in native_ids
-            ):
-                return agent
+        primary_identifiers.add(parsed)
+    secondary_identifiers = {
+        str(task[key])
+        for key in ("session_id", "requested_session_id")
+        if task.get(key)
+    }
+    identifier_groups = [primary_identifiers]
+    if not primary_identifiers:
+        identifier_groups.append(secondary_identifiers)
+    for identifiers in identifier_groups:
+        for agent in agents:
+            native_ids = {value for value in (agent_id(agent), agent_session_id(agent)) if value}
+            for expected in identifiers:
+                if any(
+                    native == expected
+                    or native.startswith(expected)
+                    or expected.startswith(native)
+                    for native in native_ids
+                ):
+                    return agent
+        if identifiers:
+            return None
     candidates = [
         agent
         for agent in agents
@@ -365,11 +571,32 @@ def claude_user_provider() -> dict[str, str | None]:
     }
 
 
+def cc_switch_database() -> Path:
+    if CC_SWITCH_DB_OVERRIDE:
+        return Path(CC_SWITCH_DB_OVERRIDE).expanduser()
+    candidates = [Path.home() / ".cc-switch" / "cc-switch.db"]
+    if PLATFORM == "win32":
+        for variable in ("APPDATA", "LOCALAPPDATA"):
+            root = os.environ.get(variable)
+            if not root:
+                continue
+            candidates.extend(
+                [
+                    Path(root) / "CCSwitch" / "cc-switch.db",
+                    Path(root) / "cc-switch" / "cc-switch.db",
+                    Path(root) / "CC Switch" / "cc-switch.db",
+                ]
+            )
+    return next((candidate for candidate in candidates if candidate.exists()), candidates[0])
+
+
 def cc_switch_provider() -> dict[str, Any] | None:
-    if not CC_SWITCH_DB.exists():
+    database = cc_switch_database()
+    if not database.exists():
         return None
     try:
-        connection = sqlite3.connect(f"file:{CC_SWITCH_DB}?mode=ro", uri=True)
+        database_uri = database.expanduser().resolve().as_uri()
+        connection = sqlite3.connect(f"{database_uri}?mode=ro", uri=True)
         row = connection.execute(
             "SELECT id, name, settings_config FROM providers "
             "WHERE app_type='claude' AND is_current=1 LIMIT 1"
@@ -458,12 +685,64 @@ def prepare_background_daemon(
     run_claude(["daemon", "stop", "--any"], check=False)
 
 
+def platform_readiness() -> dict[str, Any]:
+    python_supported = sys.version_info >= (3, 9)
+    payload: dict[str, Any] = {
+        "name": PLATFORM,
+        "python_version": ".".join(str(part) for part in sys.version_info[:3]),
+        "python_supported": python_supported,
+        "supported": PLATFORM in {"darwin", "win32"},
+    }
+    if PLATFORM == "darwin":
+        osascript = shutil.which(OSASCRIPT_BIN or "osascript")
+        payload.update(
+            {
+                "visible_terminal": "Terminal",
+                "visible_terminal_ready": bool(osascript),
+                "terminal_executable": osascript,
+                "manual_action": None if osascript else "Install or restore macOS Terminal automation support.",
+            }
+        )
+    elif PLATFORM == "win32":
+        powershell = shutil.which(POWERSHELL_BIN) or shutil.which("pwsh.exe")
+        wt = shutil.which(WINDOWS_TERMINAL_BIN)
+        bridge = Path(__file__).with_name("windows_terminal_bridge.ps1")
+        payload.update(
+            {
+                "visible_terminal": "Windows Terminal" if wt else "PowerShell",
+                "visible_terminal_ready": bool(powershell and bridge.is_file()),
+                "powershell_executable": powershell,
+                "windows_terminal_executable": wt,
+                "windows_terminal_optional": True,
+                "bridge_available": bridge.is_file(),
+                "manual_action": (
+                    None
+                    if powershell and bridge.is_file()
+                    else "Install PowerShell and reinstall the complete manage-claude-code skill."
+                ),
+            }
+        )
+    else:
+        payload.update(
+            {
+                "visible_terminal": None,
+                "visible_terminal_ready": False,
+                "manual_action": "Use this skill on macOS or Windows.",
+            }
+        )
+    payload["ready"] = bool(
+        payload["supported"] and python_supported and payload["visible_terminal_ready"]
+    )
+    return payload
+
+
 def command_doctor(args: argparse.Namespace) -> None:
     executable = shutil.which(CLAUDE_BIN)
     if not executable:
         emit({"ready": False, "error": f"Claude Code executable not found: {CLAUDE_BIN}"}, 1)
     version = run_claude(["--version"]).stdout.strip()
     auth = run_claude(["auth", "status"], check=False)
+    agents_check = run_claude(["agents", "--json"], check=False)
     try:
         auth_payload: Any = json.loads(auth.stdout) if auth.stdout.strip() else {}
     except json.JSONDecodeError:
@@ -471,7 +750,8 @@ def command_doctor(args: argparse.Namespace) -> None:
     override_sources = configured_overrides()
     overrides = sorted(set(override_sources["process"] + override_sources["user_settings"]))
     probe_payload: dict[str, Any] | None = None
-    ready = auth.returncode == 0
+    platform = platform_readiness()
+    ready = auth.returncode == 0 and agents_check.returncode == 0 and platform["ready"]
     provider = resolve_provider(args.provider_source)
     if args.probe:
         probe_command = provider_cli_args(provider) + ["-p", "--permission-mode", "plan"]
@@ -496,6 +776,12 @@ def command_doctor(args: argparse.Namespace) -> None:
             "CC Switch's current provider is not applied to Claude user settings. "
             "Re-enable that provider in CC Switch before starting a background task."
         )
+        ready = False
+    elif PLATFORM == "win32" and not platform.get("windows_terminal_executable"):
+        warning = (
+            "Windows Terminal was not found. The skill can use a PowerShell window, "
+            "but installing Windows Terminal provides better focus and window reuse."
+        )
     elif overrides and not args.probe:
         warning = (
             "Environment credentials may override the reported login. "
@@ -507,12 +793,15 @@ def command_doctor(args: argparse.Namespace) -> None:
             "executable": executable,
             "version": version,
             "authenticated": auth.returncode == 0,
+            "background_sessions_available": agents_check.returncode == 0,
             "auth": auth_payload,
             "credential_override_variables": overrides,
             "credential_override_sources": override_sources,
             "live_probe": probe_payload,
             "warning": warning,
             "provider": public_provider(provider),
+            "platform": platform,
+            "cc_switch_database": str(cc_switch_database()),
             "state_file": str(STATE_FILE),
         },
         0 if ready else 1,
@@ -616,7 +905,7 @@ def command_start(args: argparse.Namespace) -> None:
             "native_agent": current,
             "window": window,
             "visibility": (
-                "Claude Code is running in the background and attached in a visible Terminal window."
+                "Claude Code is running in the background and attached in its reusable visible terminal window."
                 if window and window.get("opened")
                 else "Claude Code is running in the background; use open-window or attach to enter its live terminal session."
             ),
@@ -740,7 +1029,7 @@ def command_resume(args: argparse.Namespace) -> None:
             "task": task,
             "window": window,
             "visibility": (
-                "Claude Code resumed in the background and attached in a visible Terminal window."
+                "Claude Code resumed in the background and attached in its reusable visible terminal window."
                 if window and window.get("opened")
                 else "Claude Code resumed in the background; use open-window or attach to enter its live terminal session."
             ),
@@ -775,7 +1064,10 @@ def command_attach(args: argparse.Namespace) -> None:
         raise ManagerError(f"Claude Code executable not found: {CLAUDE_BIN}")
     command = [executable, "attach", task_agent_id(task)]
     if args.print_only or not (sys.stdin.isatty() and sys.stdout.isatty()):
-        emit({"task_id": task["id"], "interactive_required": True, "command": shlex.join(command)})
+        printable = subprocess.list2cmdline(command) if PLATFORM == "win32" else shlex.join(command)
+        emit({"task_id": task["id"], "interactive_required": True, "command": printable})
+    if PLATFORM == "win32":
+        raise SystemExit(subprocess.call(command))
     os.execv(executable, command)
 
 
@@ -820,7 +1112,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument(
         "--open-window",
         action="store_true",
-        help="Open or reuse the task's macOS Terminal window and attach to Claude Code",
+        help="Open or reuse the task's macOS or Windows terminal window and attach to Claude Code",
     )
     start.set_defaults(func=command_start)
     listing = subparsers.add_parser("list", help="List managed tasks")
@@ -840,7 +1132,7 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument(
         "--open-window",
         action="store_true",
-        help="Reuse the task's macOS Terminal window and attach to the resumed Claude Code task",
+        help="Reuse the task's visible terminal window and attach to the resumed Claude Code task",
     )
     resume.set_defaults(func=command_resume)
     stop = subparsers.add_parser("stop", help="Stop a background task")
@@ -852,7 +1144,7 @@ def build_parser() -> argparse.ArgumentParser:
     attach.set_defaults(func=command_attach)
     open_window = subparsers.add_parser(
         "open-window",
-        help="Open or focus the managed task's macOS Terminal window",
+        help="Open or focus the managed task's macOS or Windows terminal window",
     )
     open_window.add_argument("task_id")
     open_window.set_defaults(func=command_open_window)

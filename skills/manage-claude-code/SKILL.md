@@ -18,6 +18,8 @@ python3 <skill-dir>/scripts/claude_task.py doctor
 python3 <skill-dir>/scripts/claude_task.py doctor --probe
 ```
 
+Treat `ready: true` as the launch gate. Report the `platform` section in business language when setup is incomplete. On Windows, Windows Terminal is preferred but optional; PowerShell is required. Do not install missing software or change PowerShell policy, credentials, or providers without a separate user request.
+
 Provider selection defaults to `auto`. When CC Switch is installed and has a current Claude provider, the script reads its database without exposing credentials in output or the task ledger. Background workers require CC Switch's selected provider to match the model and base URL actually written to `~/.claude/settings.json`; if they differ, stop and ask the user to re-enable the intended provider in CC Switch. Before starting the first CC Switch task with no other active background agents, the manager restarts Claude's transient background daemon so it cannot retain a previously selected provider. It must not restart a daemon serving active sessions from another or unknown provider. Use `--provider-source claude` only when the user explicitly wants Claude's own user settings instead. The live probe is mandatory because `claude auth status` can report a saved login even when the effective provider cannot authenticate. It makes one small model request and may incur normal provider usage. Run it again after credentials or providers change. Stop and explain the missing prerequisite if Claude Code is absent, unauthenticated, or the probe fails. Do not install, update, change credentials, or log in without a separate user request.
 
 ## Define the delegation
@@ -50,7 +52,9 @@ Set `--deployment-scope test` or `production` only when the user explicitly auth
 
 On macOS, use `--open-window` by default unless the user asks for background-only operation. This preserves Codex tracking while opening one dedicated Terminal window with its built-in `Pro` profile, attaching it to the Claude Code session, and applying Claude's dark theme for readable contrast. The manager records that window and reuses it for later `open-window` and `resume --open-window` commands; it creates a replacement only if the recorded window was closed. These choices affect only the managed session window, not the user's global Terminal default. Immediately return the manager task ID and native Claude background ID. If the window could not be opened, report the `window.error` and show the emitted `open_window` and `attach` commands. Do not claim that a successfully started process has completed the work.
 
-The first visible launch may trigger a macOS Automation permission prompt. Tell the user to allow Codex or its Python process to control Terminal. If permission is denied or the request times out, keep the background task intact and retry `open-window` only after the user grants permission.
+On Windows, also use `--open-window` by default. The manager starts one persistent PowerShell bridge in a named Windows Terminal window. Later opens focus that window, and resumed Claude background IDs are attached inside the same window. If Windows Terminal is unavailable, use the PowerShell-window fallback and report the reduced focusing capability. Do not open extra tabs or windows for the same managed task.
+
+The first visible launch may trigger a macOS Automation permission prompt. Tell the user to allow Codex or its Python process to control Terminal. On Windows, execution policy or endpoint protection may block the signed-in user's local PowerShell bridge; report the exact failure and leave the background task intact instead of weakening system policy.
 
 ## Track and report
 
@@ -85,7 +89,7 @@ When the user wants hands-on control, print or run the attachment command:
 python3 <skill-dir>/scripts/claude_task.py attach <task-id>
 ```
 
-On macOS, focus and reuse the task's visible Terminal window without taking over Codex's terminal. If its recorded window has been closed, this command creates one replacement:
+On macOS or Windows, focus and reuse the task's visible terminal window without taking over Codex's terminal. If its recorded window has been closed, this command creates one replacement:
 
 ```bash
 python3 <skill-dir>/scripts/claude_task.py open-window <task-id>

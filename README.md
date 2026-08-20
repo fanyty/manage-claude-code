@@ -13,7 +13,7 @@
 - 恢复已停止或已完成的会话
 - 输出可供用户进入 Claude Code 的连接命令
 - 启动后明确提示 Claude Code 正在后台运行，并同时给出状态、日志和进入现场的命令
-- 在 macOS 上自动打开 Terminal 窗口并进入 Claude Code 现场，同时保留 Codex 后台追踪
+- 在 macOS 或 Windows 上自动打开并复用一个任务窗口，同时保留 Codex 后台追踪
 - 要求 Codex在汇报完成前独立检查结果
 - 支持无部署、测试环境和明确授权的正式环境三种范围
 - 检测可能覆盖 Claude 登录的环境凭据，并可执行最小连通性探测
@@ -40,8 +40,9 @@ Codex验收并用业务语言汇报
 ## 前置条件
 
 - Codex 或 ChatGPT desktop app
-- Python 3.10+
+- Python 3.9+
 - 已安装并登录的 Claude Code
+- Windows 需要 PowerShell；推荐安装 Windows Terminal
 
 ## 安装
 
@@ -78,7 +79,9 @@ $HOME/.agents/skills/manage-claude-code
 
 在 macOS 上，Skill 默认使用 `--open-window`：Claude Code 仍作为后台任务运行，Codex 可以继续追踪；同时系统会为每个任务保留一个专用 Terminal 窗口并自动进入 Claude Code 现场。后续查看和续跑都会聚焦、复用这个窗口，保留连续的现场上下文，不会反复打开多个窗口；只有该窗口被关闭后才会创建一个替代窗口。这个窗口使用系统自带的 `Pro` 深色配置，Claude 会话使用深色主题，不会修改 Terminal 的全局默认配置。每次启动后，Skill 会返回管理任务编号、Claude 后台编号，以及查看状态、查看日志、当前终端连接和聚焦任务窗口的命令。
 
-第一次打开窗口时，macOS 可能询问是否允许 Codex（或其 Python 进程）控制 Terminal，需要点击允许。若没有授权，Skill 会在等待 20 秒后返回清楚的权限提示，后台 Claude 任务不会因此丢失。
+在 Windows 上，Skill 优先使用 Windows Terminal，并在其中运行一个持续等待任务更新的 PowerShell 桥接程序。每个任务使用固定窗口名称；查看任务时聚焦原窗口，续跑时在原窗口连接新的 Claude 后台编号，不重复创建窗口或标签页。没有 Windows Terminal 时可以降级到普通 PowerShell 窗口，但窗口聚焦能力可能受系统限制。
+
+第一次打开窗口时，macOS 可能询问是否允许 Codex（或其 Python 进程）控制 Terminal，需要点击允许。Windows 的安全软件或执行策略可能拦截本地 PowerShell 桥接程序。Skill 只报告具体问题，不会自动降低安全设置；后台 Claude 任务不会因此丢失。
 
 首次启动任务前，Skill 会执行一次最小真实请求来验证后台凭证。原因是 `claude auth status` 可能显示已经登录，但后台进程仍可能无法刷新登录信息。验证失败时，Skill 会停止启动并提示用户处理登录，不会把一个无法工作的进程误报为正常开发中。
 
