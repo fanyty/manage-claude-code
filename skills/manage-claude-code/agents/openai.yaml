@@ -1,0 +1,4 @@
+interface:
+  display_name: "Claude Code Manager"
+  short_description: "Direct and track local Claude Code tasks"
+  default_prompt: "Use $manage-claude-code to delegate this development task to my local Claude Code and track it to completion."
